@@ -5,11 +5,8 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 # Logging setup
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# Dictionaries for group settings & user warnings
+# Group settings state (Database ki jagah memory dict use kiya hai)
 group_settings = {}
-user_warnings = {}  # {chat_id: {user_id: warning_count}}
-
-MAX_WARNINGS = 3  # Set maximum warnings limit before ban
 
 def get_settings(chat_id):
     if chat_id not in group_settings:
@@ -17,83 +14,49 @@ def get_settings(chat_id):
             "nolinks": False,
             "noforwards": False,
             "nocontacts": False,
+            "noevents": False,
             "autodelete": False,
             "blacklist": []
         }
     return group_settings[chat_id]
 
-# Warning and Auto-Ban System Function
-async def handle_warning_and_ban(update: Update, context: ContextTypes.DEFAULT_TYPE, reason: str):
+# Warning sender utility function
+async def send_warning(update: Update, context: ContextTypes.DEFAULT_TYPE, reason: str):
     user = update.message.from_user
     chat_id = update.effective_chat.id
-    user_id = user.id
-
-    # Infringing message ko delete karna
+    
+    # Message delete agar setting on ho
     try:
         await update.message.delete()
     except Exception:
         pass
 
-    # Warning count update karna
-    if chat_id not in user_warnings:
-        user_warnings[chat_id] = {}
-    
-    user_warnings[chat_id][user_id] = user_warnings[chat_id].get(user_id, 0) + 1
-    current_warns = user_warnings[chat_id][user_id]
+    # Warning message format
+    warning_text = (
+        f"⚠️ **Group Security Warning**\n\n"
+        f"👤 **User:** {user.full_name}\n"
+        f"🆔 **ID:** `{user.id}`\n"
+        f"📌 **Reason:** {reason}"
+    )
 
+    # Inline Keyboard Button
     bot_username = context.bot.username
     keyboard = [[InlineKeyboardButton("🛡️ Protect Your Group", url=f"https://t.me/{bot_username}?start=help")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    # Agar warnings limit tak pahunch jaye to Ban notification bhejna
-    if current_warns >= MAX_WARNINGS:
-        try:
-            # User ko group se ban karna
-            await context.bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
-            
-            ban_text = (
-                f"🚫 **USER BANNED FROM GROUP**\n\n"
-                f"👤 **User:** {user.full_name}\n"
-                f"🆔 **ID:** `{user.id}`\n"
-                f"📌 **Reason:** Crossed maximum warning limit ({MAX_WARNINGS}/{MAX_WARNINGS}). Last violation: {reason}"
-            )
-            
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=ban_text,
-                parse_mode="Markdown",
-                reply_markup=reply_markup
-            )
-            
-            # Ban karne ke baad warning reset karna
-            user_warnings[chat_id][user_id] = 0
-
-        except Exception as e:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"⚠️ User ban nahi ho saka! Bot ko **Ban Users** ki permission dein."
-            )
-    else:
-        # Warning Notification Message
-        warning_text = (
-            f"⚠️️ **GROUP SECURITY WARNING ({current_warns}/{MAX_WARNINGS})**\n\n"
-            f"👤 **User:** {user.full_name}\n"
-            f"🆔 **ID:** `{user.id}`\n"
-            f"📌 **Reason:** {reason}"
-        )
-
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=warning_text,
-            parse_mode="Markdown",
-            reply_markup=reply_markup
-        )
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=warning_text,
+        parse_mode="Markdown",
+        reply_markup=reply_markup
+    )
 
 # --- COMMAND HANDLERS ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot active hai! Group me admin permissions de kar setup karein.")
+    await update.message.reply_text("Bot active hai! Group me add karke admin permissions de.")
 
+# 1. Renamed Auto Delete Command
 async def autodelete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     settings = get_settings(chat_id)
@@ -101,6 +64,7 @@ async def autodelete_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     status = "ON" if settings["autodelete"] else "OFF"
     await update.message.reply_text(f"🗑️ Auto-Delete feature is now **{status}**.")
 
+# 2. No Links Filter
 async def nolinks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     settings = get_settings(chat_id)
@@ -108,6 +72,7 @@ async def nolinks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = "ON" if settings["nolinks"] else "OFF"
     await update.message.reply_text(f"🔗 Link Filter is now **{status}**.")
 
+# 3. No Forwards Filter
 async def noforwards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     settings = get_settings(chat_id)
@@ -115,6 +80,7 @@ async def noforwards_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     status = "ON" if settings["noforwards"] else "OFF"
     await update.message.reply_text(f"🔄 Forward Filter is now **{status}**.")
 
+# 4. No Contacts Filter
 async def nocontacts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     settings = get_settings(chat_id)
@@ -122,6 +88,7 @@ async def nocontacts_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     status = "ON" if settings["nocontacts"] else "OFF"
     await update.message.reply_text(f"📱 Contact Sharing Filter is now **{status}**.")
 
+# 5. Blacklist Commands
 async def blacklist_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: `/blacklist_add <word>`")
@@ -155,24 +122,24 @@ async def monitor_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Check Link Filter
     if settings["nolinks"] and ("http://" in text or "https://" in text or "t.me/" in text):
-        await handle_warning_and_ban(update, context, "Unauthorised link shared.")
+        await send_warning(update, context, "Links send karna allowed nahi hai.")
         return
 
     # Check Forward Filter
     if settings["noforwards"] and msg.forward_date:
-        await handle_warning_and_ban(update, context, "Forwarded message shared.")
+        await send_warning(update, context, "Forwarded messages allow nahi hain.")
         return
 
     # Check Contact Filter
     if settings["nocontacts"] and msg.contact:
-        await handle_warning_and_ban(update, context, "Contact info shared.")
+        await send_warning(update, context, "Phone numbers / Contacts share karna मना hai.")
         return
 
     # Check Blacklist Words
     if settings["blacklist"]:
         for word in settings["blacklist"]:
             if word in text.lower():
-                await handle_warning_and_ban(update, context, f"Used blacklisted word: `{word}`")
+                await send_warning(update, context, f"Blacklisted word use kiya: `{word}`")
                 return
 
     # Auto Delete Option (General Messages)
@@ -182,7 +149,7 @@ async def monitor_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-# Main Bot Setup
+# Main Bot Function
 def main():
     BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
     app = ApplicationBuilder().token(BOT_TOKEN).build()
