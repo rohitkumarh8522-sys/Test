@@ -33,7 +33,7 @@ threading.Thread(target=start_dummy_server, daemon=True).start()
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ChatPrivileges
 from pyrogram.errors import ChatAdminRequired, RPCError
-from pyrogram.raw import functions, types
+from pyrogram.raw import functions
 
 # --- CONFIGURATION ---
 API_ID = int(os.environ.get("API_ID", "1234567"))
@@ -49,7 +49,7 @@ last_bot_msg = {}
 # --- HELPER FOR GLOBAL BUTTON ---
 def get_protect_btn(client: Client):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Protect your group 🛡️", url=f"https://t.me/{client.me.username}?startgroup=true")]
+        [InlineKeyboardButton("Protect your group 🛡️️", url=f"https://t.me/{client.me.username}?startgroup=true")]
     ])
 
 # --- DATABASE SETUP ---
@@ -62,16 +62,33 @@ CREATE TABLE IF NOT EXISTS groups (
     title TEXT,
     username TEXT,
     autodelete_sec INTEGER DEFAULT 0,
-    forward_protect INTEGER DEFAULT 0
+    forward_protect INTEGER DEFAULT 1,
+    nolinks INTEGER DEFAULT 1,
+    profanity_filter INTEGER DEFAULT 1,
+    bio_scanner INTEGER DEFAULT 1
 )
 """)
 
-# Safe migration for existing databases
-try:
-    cursor.execute("ALTER TABLE groups ADD COLUMN forward_protect INTEGER DEFAULT 0")
-    conn.commit()
-except sqlite3.OperationalError:
-    pass
+# Safe schema migrations for existing DB
+for col_def in [
+    "forward_protect INTEGER DEFAULT 1",
+    "nolinks INTEGER DEFAULT 1",
+    "profanity_filter INTEGER DEFAULT 1",
+    "bio_scanner INTEGER DEFAULT 1"
+]:
+    try:
+        cursor.execute(f"ALTER TABLE groups ADD COLUMN {col_def}")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS badwords (
+    chat_id INTEGER,
+    word TEXT,
+    PRIMARY KEY (chat_id, word)
+)
+""")
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS warnings (
@@ -83,9 +100,15 @@ CREATE TABLE IF NOT EXISTS warnings (
 """)
 conn.commit()
 
+# --- DEFAULT BAD WORDS LIST ---
+DEFAULT_BAD_WORDS = [
+    "gali", "mc", "bc", "bhenchod", "madarchod", "chutiya", "gaand", "bhosdike",
+    "harami", "laude", "lodu", "randi", "saale", "fuck", "bitch", "bastard", "asshole"
+]
+
 LINK_PATTERN = re.compile(r'(https?://|t\.me/|telegram\.me/|telegram\.dog/|@[a-zA-Z0-9_]{4,})', re.IGNORECASE)
 
-# --- HELPER PARSER FOR LINKS / USERNAME / IDS ---
+# --- HELPER PARSER ---
 def parse_target(input_str: str):
     input_str = input_str.strip()
     c_match = re.search(r't\.me/c/(\d+)', input_str)
@@ -98,7 +121,7 @@ def parse_target(input_str: str):
         return int(input_str)
     return input_str
 
-# --- DATABASE HELPERS ---
+# --- DB HELPERS ---
 def save_or_update_group(chat_id, title, username):
     cursor.execute("""
     INSERT INTO groups (chat_id, title, username) VALUES (?, ?, ?)
@@ -106,23 +129,22 @@ def save_or_update_group(chat_id, title, username):
     """, (chat_id, title, username))
     conn.commit()
 
-def set_autodelete(chat_id, seconds):
-    cursor.execute("UPDATE groups SET autodelete_sec = ? WHERE chat_id = ?", (seconds, chat_id))
-    conn.commit()
-
-def get_autodelete(chat_id):
-    cursor.execute("SELECT autodelete_sec FROM groups WHERE chat_id = ?", (chat_id,))
+def get_group_settings(chat_id):
+    cursor.execute("SELECT autodelete_sec, forward_protect, nolinks, profanity_filter, bio_scanner FROM groups WHERE chat_id = ?", (chat_id,))
     res = cursor.fetchone()
-    return res[0] if res else 0
+    if not res:
+        return {"autodelete_sec": 0, "forward_protect": 1, "nolinks": 1, "profanity_filter": 1, "bio_scanner": 1}
+    return {
+        "autodelete_sec": res[0],
+        "forward_protect": res[1],
+        "nolinks": res[2],
+        "profanity_filter": res[3],
+        "bio_scanner": res[4]
+    }
 
-def set_forward_protect(chat_id, status: int):
-    cursor.execute("UPDATE groups SET forward_protect = ? WHERE chat_id = ?", (status, chat_id))
+def update_group_setting(chat_id, column, value):
+    cursor.execute(f"UPDATE groups SET {column} = ? WHERE chat_id = ?", (value, chat_id))
     conn.commit()
-
-def get_forward_protect(chat_id):
-    cursor.execute("SELECT forward_protect FROM groups WHERE chat_id = ?", (chat_id,))
-    res = cursor.fetchone()
-    return res[0] if res and res[0] is not None else 0
 
 def get_all_groups_details():
     cursor.execute("SELECT chat_id, title, username FROM groups")
@@ -142,6 +164,19 @@ def add_warn(chat_id, user_id):
 def reset_warns(chat_id, user_id):
     cursor.execute("DELETE FROM warnings WHERE chat_id = ? AND user_id = ?", (chat_id,))
     conn.commit()
+
+def add_custom_bad_word(chat_id, word):
+    cursor.execute("INSERT OR IGNORE INTO badwords (chat_id, word) VALUES (?, ?)", (chat_id, word.lower()))
+    conn.commit()
+
+def remove_custom_bad_word(chat_id, word):
+    cursor.execute("DELETE FROM badwords WHERE chat_id = ? AND word = ?", (chat_id, word.lower()))
+    conn.commit()
+
+def get_group_bad_words(chat_id):
+    cursor.execute("SELECT word FROM badwords WHERE chat_id = ?", (chat_id,))
+    custom = [row[0] for row in cursor.fetchall()]
+    return list(set(DEFAULT_BAD_WORDS + custom))
 
 async def delete_after_delay(chat_id: int, message_id: int, delay: int):
     await asyncio.sleep(delay)
@@ -166,155 +201,211 @@ async def check_bot_admin_rights(client: Client, chat_id: int):
         
         priv = member.privileges
         if not priv or not (priv.can_delete_messages and priv.can_restrict_members):
-            return False, "Missing 'Delete Messages' or 'Ban Users' permissions"
+            return False, "Missing Delete Messages or Ban Users permission"
             
         return True, "Full Access"
     except Exception as e:
         return False, str(e)
 
 
-# --- COMMAND: /start & /help ---
+# --- COMMAND: /start & /help (IMAGE 1 LAYOUT) ---
 @app.on_message(filters.command(["start", "help"]))
 async def start_command(client: Client, message: Message):
     protect_btn = get_protect_btn(client)
-    if message.chat.type.value == "private":
-        start_text = (
-            "🛡️ **Bio Guard & Group Protection System**\n"
-            "───•────────────────•───\n\n"
-            "Welcome! I am an automated security bot designed to protect your Telegram groups from promotional bio links, profile channels, forwarded spam, and auto-clean group messages.\n\n"
-            "⚡ **Core Features:**\n"
-            "• **Bio & Profile Channel Scanner**: Detects links in bios and attached Profile Channels, warning/banning spammers.\n"
-            "• **Forward Protect**: Automatically deletes forwarded messages from members.\n"
-            "• **Auto Delete**: Automatically cleans up group messages on a custom schedule.\n\n"
-            "⚙️ **Group Admin Commands:**\n"
-            "• `/status` — Check bot health, latency & protection status.\n"
-            "• `/forwardprotect <on/off>` — Block forwarded messages in group.\n"
-            "• `/autodelete <on/off/seconds>` — Enable/disable or set timer for auto deletion.\n"
-            "• `/resetwarn` — Reply to a member to reset their active warnings.\n\n"
-            "📌 **Setup Guide:**\n"
-            "1. Add me to your group.\n"
-            "2. Promote me to **Admin** with **Delete Messages** & **Ban Users** permissions."
-        )
-        await message.reply_text(start_text, reply_markup=protect_btn, disable_web_page_preview=True)
-    else:
-        group_text = (
-            "🛡️ **Bio Guard Security Panel**\n"
-            "───•────────────────•───\n\n"
-            "⚙️ **Available Admin Commands:**\n"
-            "• `/status` — View system latency & active privileges.\n"
-            "• `/forwardprotect <on/off>` — Enable/disable forward message blocker.\n"
-            "• `/autodelete <on/off/seconds>` — Turn auto-delete ON/OFF or set seconds.\n"
-            "• `/resetwarn` — Reset warning counts for a user."
-        )
-        await message.reply_text(group_text, reply_markup=protect_btn, disable_web_page_preview=True)
+    user_name = message.from_user.first_name if message.from_user else "User"
+
+    start_text = (
+        f"👑 **{user_name}**, I can remove spam links, shortened urls, external mentions, "
+        f"forwards, reply keyboard links, unwanted advertising; hide profile bio channels; "
+        f"allow to blacklist words and domains; remove profanity and flood messages; restrict "
+        f"permissions for spammers; stop members from adding spam bots to your group.\n\n"
+        f"**How to start using bot?**\n"
+        f"1) Add **@{client.me.username}** to your group.\n"
+        f"2) Assign admin permissions (delete messages, ban users).\n"
+        f"3) Run /start command in the group.\n"
+        f"4) Change settings using **/status**.\n\n"
+        f"**/status** - Open full interactive group control panel.\n"
+        f"**/nolinks** - Filter messages with links or channel invites.\n"
+        f"**/noforwards** - Filter forwarded messages from members.\n"
+        f"**/profanity** - Filter bad words, abuse & bad language.\n"
+        f"**/bioscanner** - Filter users with channel/links in Bio or Profile Channel.\n"
+        f"**/autodelete** - Auto-delete messages after specific time.\n"
+        f"**/resetwarn** - Clear active warning points for a member."
+    )
+    await message.reply_text(start_text, reply_markup=protect_btn, disable_web_page_preview=True)
 
 
-# --- GROUP COMMAND: /status ---
+# --- GROUP COMMAND: /status (IMAGE 2 DASHBOARD LAYOUT) ---
 @app.on_message(filters.group & filters.command("status"))
 async def group_status(client: Client, message: Message):
     protect_btn = get_protect_btn(client)
-    member = await client.get_chat_member(message.chat.id, message.from_user.id)
+    chat_id = message.chat.id
+    user_name = message.from_user.first_name if message.from_user else "User"
+
+    member = await client.get_chat_member(chat_id, message.from_user.id)
     if member.status.value not in ["administrator", "owner"] and message.from_user.id != OWNER_ID:
         return await message.reply_text("❌ This command is restricted to Group Admins.", reply_markup=protect_btn)
 
-    start_time = time.time()
-    status_msg = await message.reply_text("⚡ **Checking system parameters...**", reply_markup=protect_btn)
-    latency = round((time.time() - start_time) * 1000, 2)
-
-    is_ok, reason = await check_bot_admin_rights(client, message.chat.id)
-    admin_str = "✅ Active & Operational" if is_ok else f"⚠️ Permission Error: {reason}"
+    save_or_update_group(chat_id, message.chat.title, message.chat.username)
+    is_ok, reason = await check_bot_admin_rights(client, chat_id)
     
-    auto_del = get_autodelete(message.chat.id)
-    auto_del_str = f"{auto_del} Seconds" if auto_del > 0 else "Disabled ❌"
+    settings = get_group_settings(chat_id)
 
-    fwd_prot = get_forward_protect(message.chat.id)
-    fwd_str = "ENABLED ✅" if fwd_prot == 1 else "DISABLED ❌"
+    # Status formatting like Protectron Bot (Image 2)
+    admin_icon = "✅" if is_ok else "❌"
+    del_icon = "✅" if is_ok else "❌"
+    ban_icon = "✅" if is_ok else "❌"
+
+    links_icon = "✅" if settings["nolinks"] == 1 else "⬜"
+    fwds_icon = "✅" if settings["forward_protect"] == 1 else "⬜"
+    profanity_icon = "✅" if settings["profanity_filter"] == 1 else "⬜"
+    bio_icon = "✅" if settings["bio_scanner"] == 1 else "⬜"
+    autodel_icon = f"✅ ({settings['autodelete_sec']}s)" if settings["autodelete_sec"] > 0 else "⬜"
 
     status_text = (
-        f"📊 **Group Security Status**\n"
-        f"───•────────────────•───\n\n"
-        f"⚙️ **Bot Privilege:** `{admin_str}`\n"
-        f"🛡️ **Bio & Profile Scanner:** `{'ENABLED' if is_ok else 'DISABLED (Needs Admin Rights)'}`\n"
-        f"🚫 **Forward Protection:** `{fwd_str}`\n"
-        f"⏱️ **Auto Delete:** `{auto_del_str}`\n"
-        f"⚡ **Server Latency:** `{latency} ms`\n\n"
-        f"💡 *Use `/forwardprotect on/off` & `/autodelete on/off` to configure.*"
+        f"👑 **{user_name}**, bot status:\n"
+        f"{admin_icon} Administrator\n"
+        f"{del_icon} Can delete messages\n"
+        f"{ban_icon} Can restrict members\n\n"
+        f"**Filters:**\n"
+        f"{bio_icon} Profile Bio & Channel filter `/bioscanner`\n"
+        f"{links_icon} Links filter `/nolinks`\n"
+        f"{fwds_icon} Forwards filter `/noforwards`\n"
+        f"{profanity_icon} Bad words filter `/profanity`\n"
+        f"{autodel_icon} Frequent messages filter `/autodelete`\n\n"
+        f"💡 *Use the commands above (e.g. `/profanity on/off`) to toggle filters.*"
     )
-    await status_msg.edit_text(status_text, reply_markup=protect_btn)
+    await message.reply_text(status_text, reply_markup=protect_btn)
 
 
-# --- GROUP ADMIN COMMAND: Toggle Forward Protection ---
-@app.on_message(filters.group & filters.command("forwardprotect"))
-async def toggle_forward_protection(client: Client, message: Message):
+# --- FILTER TOGGLE COMMANDS ---
+@app.on_message(filters.group & filters.command("profanity"))
+async def toggle_profanity(client: Client, message: Message):
     protect_btn = get_protect_btn(client)
     member = await client.get_chat_member(message.chat.id, message.from_user.id)
     if member.status.value not in ["administrator", "owner"] and message.from_user.id != OWNER_ID:
-        return await message.reply_text("❌ This command is restricted to Group Admins.", reply_markup=protect_btn)
+        return await message.reply_text("❌ Command restricted to Admins.", reply_markup=protect_btn)
 
     if len(message.command) < 2:
-        curr = get_forward_protect(message.chat.id)
-        status_str = "ENABLED ✅" if curr == 1 else "DISABLED ❌"
-        return await message.reply_text(
-            f"💡 **Usage:** `/forwardprotect on` or `/forwardprotect off`\n\n"
-            f"🛡️ **Current Status:** `{status_str}`",
-            reply_markup=protect_btn
-        )
+        st = get_group_settings(message.chat.id)["profanity_filter"]
+        return await message.reply_text(f"💡 **Usage:** `/profanity on` or `/profanity off`\nStatus: `{'ENABLED ✅' if st==1 else 'DISABLED ⬜'}`", reply_markup=protect_btn)
 
     arg = message.command[1].lower()
-    if arg in ["on", "enable", "yes"]:
-        set_forward_protect(message.chat.id, 1)
-        await message.reply_text("✅ **Forward Protection ENABLED!** Forwarded messages from members will now be automatically deleted.", reply_markup=protect_btn)
-    elif arg in ["off", "disable", "no"]:
-        set_forward_protect(message.chat.id, 0)
-        await message.reply_text("🚫 **Forward Protection DISABLED.**", reply_markup=protect_btn)
-    else:
-        await message.reply_text("❌ Invalid argument! Use `/forwardprotect on` or `/forwardprotect off`.", reply_markup=protect_btn)
+    val = 1 if arg in ["on", "enable", "yes"] else 0
+    update_group_setting(message.chat.id, "profanity_filter", val)
+    await message.reply_text(f"🤬 **Bad Words Filter** is now **{'ENABLED ✅' if val==1 else 'DISABLED ⬜'}**", reply_markup=protect_btn)
 
 
-# --- GROUP ADMIN COMMAND: Set or Toggle Auto Delete ---
-@app.on_message(filters.group & filters.command(["setdelete", "autodelete"]))
-async def set_delete_time(client: Client, message: Message):
+@app.on_message(filters.group & filters.command("nolinks"))
+async def toggle_nolinks(client: Client, message: Message):
     protect_btn = get_protect_btn(client)
     member = await client.get_chat_member(message.chat.id, message.from_user.id)
     if member.status.value not in ["administrator", "owner"] and message.from_user.id != OWNER_ID:
-        return await message.reply_text("❌ This command is restricted to Group Admins.", reply_markup=protect_btn)
+        return await message.reply_text("❌ Command restricted to Admins.", reply_markup=protect_btn)
 
     if len(message.command) < 2:
-        curr = get_autodelete(message.chat.id)
-        status_str = f"{curr} Seconds ✅" if curr > 0 else "DISABLED ❌"
-        return await message.reply_text(
-            f"💡 **Usage:**\n"
-            f"• `/autodelete on` — Enable with default (60s)\n"
-            f"• `/autodelete off` — Disable auto delete\n"
-            f"• `/autodelete <seconds>` — Custom duration (e.g. `/autodelete 30`)\n\n"
-            f"⏱️️ **Current Auto Delete:** `{status_str}`",
-            reply_markup=protect_btn
-        )
+        st = get_group_settings(message.chat.id)["nolinks"]
+        return await message.reply_text(f"💡 **Usage:** `/nolinks on` or `/nolinks off`\nStatus: `{'ENABLED ✅' if st==1 else 'DISABLED ⬜'}`", reply_markup=protect_btn)
+
+    arg = message.command[1].lower()
+    val = 1 if arg in ["on", "enable", "yes"] else 0
+    update_group_setting(message.chat.id, "nolinks", val)
+    await message.reply_text(f"🔗 **Links Filter** is now **{'ENABLED ✅' if val==1 else 'DISABLED ⬜'}**", reply_markup=protect_btn)
+
+
+@app.on_message(filters.group & filters.command(["noforwards", "forwardprotect"]))
+async def toggle_noforwards(client: Client, message: Message):
+    protect_btn = get_protect_btn(client)
+    member = await client.get_chat_member(message.chat.id, message.from_user.id)
+    if member.status.value not in ["administrator", "owner"] and message.from_user.id != OWNER_ID:
+        return await message.reply_text("❌ Command restricted to Admins.", reply_markup=protect_btn)
+
+    if len(message.command) < 2:
+        st = get_group_settings(message.chat.id)["forward_protect"]
+        return await message.reply_text(f"💡 **Usage:** `/noforwards on` or `/noforwards off`\nStatus: `{'ENABLED ✅' if st==1 else 'DISABLED ⬜'}`", reply_markup=protect_btn)
+
+    arg = message.command[1].lower()
+    val = 1 if arg in ["on", "enable", "yes"] else 0
+    update_group_setting(message.chat.id, "forward_protect", val)
+    await message.reply_text(f"⏩ **Forwards Filter** is now **{'ENABLED ✅' if val==1 else 'DISABLED ⬜'}**", reply_markup=protect_btn)
+
+
+@app.on_message(filters.group & filters.command("bioscanner"))
+async def toggle_bioscanner(client: Client, message: Message):
+    protect_btn = get_protect_btn(client)
+    member = await client.get_chat_member(message.chat.id, message.from_user.id)
+    if member.status.value not in ["administrator", "owner"] and message.from_user.id != OWNER_ID:
+        return await message.reply_text("❌ Command restricted to Admins.", reply_markup=protect_btn)
+
+    if len(message.command) < 2:
+        st = get_group_settings(message.chat.id)["bio_scanner"]
+        return await message.reply_text(f"💡 **Usage:** `/bioscanner on` or `/bioscanner off`\nStatus: `{'ENABLED ✅' if st==1 else 'DISABLED ⬜'}`", reply_markup=protect_btn)
+
+    arg = message.command[1].lower()
+    val = 1 if arg in ["on", "enable", "yes"] else 0
+    update_group_setting(message.chat.id, "bio_scanner", val)
+    await message.reply_text(f"👤 **Bio & Profile Scanner** is now **{'ENABLED ✅' if val==1 else 'DISABLED ⬜'}**", reply_markup=protect_btn)
+
+
+@app.on_message(filters.group & filters.command(["autodelete", "setdelete"]))
+async def toggle_autodelete(client: Client, message: Message):
+    protect_btn = get_protect_btn(client)
+    member = await client.get_chat_member(message.chat.id, message.from_user.id)
+    if member.status.value not in ["administrator", "owner"] and message.from_user.id != OWNER_ID:
+        return await message.reply_text("❌ Command restricted to Admins.", reply_markup=protect_btn)
+
+    if len(message.command) < 2:
+        st = get_group_settings(message.chat.id)["autodelete_sec"]
+        return await message.reply_text(f"💡 **Usage:** `/autodelete on` (60s), `/autodelete off`, or `/autodelete 30`\nStatus: `{st} seconds`", reply_markup=protect_btn)
 
     arg = message.command[1].lower()
     if arg in ["off", "disable", "no"]:
-        set_autodelete(message.chat.id, 0)
-        await message.reply_text("🚫 **Auto-Delete Disabled.**", reply_markup=protect_btn)
+        update_group_setting(message.chat.id, "autodelete_sec", 0)
+        await message.reply_text("⏱️ **Auto-Delete Disabled ⬜**", reply_markup=protect_btn)
     elif arg in ["on", "enable", "yes"]:
-        curr = get_autodelete(message.chat.id)
-        sec = curr if curr > 0 else 60
-        set_autodelete(message.chat.id, sec)
-        await message.reply_text(f"✅ **Auto-Delete Enabled:** Messages will be removed after **{sec} seconds**.", reply_markup=protect_btn)
+        update_group_setting(message.chat.id, "autodelete_sec", 60)
+        await message.reply_text("⏱️ **Auto-Delete Enabled (60 Seconds) ✅**", reply_markup=protect_btn)
     else:
         try:
-            seconds = int(arg)
-            if seconds < 0:
-                raise ValueError()
-            set_autodelete(message.chat.id, seconds)
-            if seconds > 0:
-                await message.reply_text(f"✅ **Auto-Delete Enabled:** Messages will be removed after **{seconds} seconds**.", reply_markup=protect_btn)
-            else:
-                await message.reply_text("🚫 **Auto-Delete Disabled.**", reply_markup=protect_btn)
+            sec = int(arg)
+            update_group_setting(message.chat.id, "autodelete_sec", sec)
+            await message.reply_text(f"⏱️ **Auto-Delete Timer set to {sec} Seconds ✅**", reply_markup=protect_btn)
         except ValueError:
-            await message.reply_text("❌ Please specify 'on', 'off', or duration in seconds (e.g. `/autodelete 120`).", reply_markup=protect_btn)
+            await message.reply_text("❌ Invalid value! Specify 'on', 'off', or seconds number.", reply_markup=protect_btn)
 
 
-# --- EVENT: Group Message Processing ---
+# --- CUSTOM BAD WORDS MANAGEMENT ---
+@app.on_message(filters.group & filters.command("addword"))
+async def add_bad_word_cmd(client: Client, message: Message):
+    protect_btn = get_protect_btn(client)
+    member = await client.get_chat_member(message.chat.id, message.from_user.id)
+    if member.status.value not in ["administrator", "owner"] and message.from_user.id != OWNER_ID:
+        return await message.reply_text("❌ Command restricted to Admins.", reply_markup=protect_btn)
+
+    if len(message.command) < 2:
+        return await message.reply_text("💡 **Usage:** `/addword <word>` (e.g. `/addword gali`)", reply_markup=protect_btn)
+
+    word = message.command[1].strip()
+    add_custom_bad_word(message.chat.id, word)
+    await message.reply_text(f"✅ Added `{word}` to group profanity blacklist.", reply_markup=protect_btn)
+
+
+@app.on_message(filters.group & filters.command("rmword"))
+async def rm_bad_word_cmd(client: Client, message: Message):
+    protect_btn = get_protect_btn(client)
+    member = await client.get_chat_member(message.chat.id, message.from_user.id)
+    if member.status.value not in ["administrator", "owner"] and message.from_user.id != OWNER_ID:
+        return await message.reply_text("❌ Command restricted to Admins.", reply_markup=protect_btn)
+
+    if len(message.command) < 2:
+        return await message.reply_text("💡 **Usage:** `/rmword <word>`", reply_markup=protect_btn)
+
+    word = message.command[1].strip()
+    remove_custom_bad_word(message.chat.id, word)
+    await message.reply_text(f"🗑️ Removed `{word}` from group profanity blacklist.", reply_markup=protect_btn)
+
+
+# --- EVENT: GROUP MESSAGE PROCESSING ---
 @app.on_message(filters.group & ~filters.service)
 async def handle_group_message(client: Client, message: Message):
     chat_id = message.chat.id
@@ -324,65 +415,103 @@ async def handle_group_message(client: Client, message: Message):
         return
 
     protect_btn = get_protect_btn(client)
-
-    # Save Group Info into Database
     save_or_update_group(chat_id, message.chat.title, message.chat.username)
 
-    # Check Bot Admin Rights
     is_bot_admin, err_msg = await check_bot_admin_rights(client, chat_id)
-
-    # If bot is not admin and someone triggers commands, show warning
     if not is_bot_admin:
         if message.text and message.text.startswith("/"):
             await delete_previous_bot_msg(chat_id)
             warn_msg = await message.reply_text(
-                "⚠️ **Admin Rights Required!**\n"
-                "───•────────────────•───\n"
-                "> Bot is disabled in this group because it lacks **Admin Rights**.\n\n"
-                "Please promote the bot to Admin with **Delete Messages** and **Ban Users** permissions to activate security.",
+                "⚠️ **Admin Rights Required!**\n> Promote bot to Admin with **Delete Messages** and **Ban Users** permissions.",
                 reply_markup=protect_btn
             )
             last_bot_msg[chat_id] = warn_msg.id
         return
 
-    # Check User Admin Status
     try:
         member = await client.get_chat_member(chat_id, user.id)
         is_admin = member.status.value in ["administrator", "owner"]
     except Exception:
         is_admin = False
 
-    # FORWARD PROTECTION SYSTEM (Non-Admins only)
-    if not is_admin and user.id != OWNER_ID:
-        is_forwarded = bool(message.forward_date or message.forward_from or message.forward_from_chat or message.forward_sender_name)
-        if is_forwarded and get_forward_protect(chat_id) == 1:
+    if is_admin or user.id == OWNER_ID:
+        return
+
+    settings = get_group_settings(chat_id)
+
+    # 1. BAD WORDS / PROFANITY FILTER
+    if settings["profanity_filter"] == 1 and message.text:
+        text_lower = message.text.lower()
+        bad_words_list = get_group_bad_words(chat_id)
+        has_bad_word = any(re.search(rf'\b{re.escape(w)}\b', text_lower) for w in bad_words_list)
+
+        if has_bad_word:
             try:
                 await message.delete()
+                warn_count = add_warn(chat_id, user.id)
                 await delete_previous_bot_msg(chat_id)
-                alert = await message.reply_text(
-                    f"🚫 **Forwarded Message Removed** • {user.mention}\n"
-                    f"> Forwarding messages is restricted in this group.",
-                    reply_markup=protect_btn
-                )
-                last_bot_msg[chat_id] = alert.id
+
+                if warn_count < 3:
+                    alert = await message.reply_text(
+                        f"🤬 **Bad Words Detected [{warn_count}/3]** • {user.mention}\n"
+                        f"> Abusive language is not allowed here.",
+                        reply_markup=protect_btn
+                    )
+                    last_bot_msg[chat_id] = alert.id
+                else:
+                    until_time = datetime.now() + timedelta(hours=1)
+                    await client.ban_chat_member(chat_id, user.id, until_date=until_time)
+                    reset_warns(chat_id, user.id)
+                    alert = await message.reply_text(
+                        f"🚫 **User Banned** • {user.mention}\n> Banned for 1 hour due to repeated abusive language.",
+                        reply_markup=protect_btn
+                    )
+                    last_bot_msg[chat_id] = alert.id
                 return
             except Exception as e:
-                print(f"Forward Delete Error: {e}")
+                print(f"Profanity error: {e}")
 
-    # BIO & PERSONAL CHANNEL PROTECTION SYSTEM (Non-Admins only)
-    if not is_admin and user.id != OWNER_ID:
+    # 2. FORWARD PROTECTION
+    is_forwarded = bool(message.forward_date or message.forward_from or message.forward_from_chat or message.forward_sender_name)
+    if settings["forward_protect"] == 1 and is_forwarded:
+        try:
+            await message.delete()
+            await delete_previous_bot_msg(chat_id)
+            alert = await message.reply_text(
+                f"⏩ **Forwarded Message Removed** • {user.mention}",
+                reply_markup=protect_btn
+            )
+            last_bot_msg[chat_id] = alert.id
+            return
+        except Exception as e:
+            print(f"Forward delete error: {e}")
+
+    # 3. MESSAGE LINKS FILTER
+    if settings["nolinks"] == 1 and message.text and LINK_PATTERN.search(message.text):
+        try:
+            await message.delete()
+            await delete_previous_bot_msg(chat_id)
+            alert = await message.reply_text(
+                f"🔗 **Link Removed** • {user.mention}\n> Posting promotional links is restricted.",
+                reply_markup=protect_btn
+            )
+            last_bot_msg[chat_id] = alert.id
+            return
+        except Exception as e:
+            print(f"Link delete error: {e}")
+
+    # 4. BIO & PROFILE CHANNEL SCANNER
+    if settings["bio_scanner"] == 1:
         try:
             has_link = False
             has_personal_channel = False
-            
+
             try:
                 peer = await client.resolve_peer(user.id)
                 full_user_data = await client.invoke(functions.users.GetFullUser(id=peer))
                 full_info = full_user_data.full_user
-                
                 user_bio = getattr(full_info, "about", "") or ""
-                personal_chan_id = getattr(full_info, "personal_channel_id", None)
-                if personal_chan_id:
+                if getattr(full_info, "personal_channel_id", None):
                     has_personal_channel = True
             except Exception:
                 user_chat = await client.get_chat(user.id)
@@ -394,50 +523,42 @@ async def handle_group_message(client: Client, message: Message):
             if has_link or has_personal_channel:
                 await message.delete()
                 warn_count = add_warn(chat_id, user.id)
-
                 await delete_previous_bot_msg(chat_id)
 
-                reason_text = "Personal Channel attached to profile" if has_personal_channel else "Bio contains promotional link/username"
+                reason_text = "Personal Channel attached to profile" if has_personal_channel else "Bio contains promotional link"
 
                 if warn_count < 3:
                     alert = await message.reply_text(
-                        f"⚠️ **Warning [{warn_count}/3]** • {user.mention}\n"
-                        f"> Reason: {reason_text}.\n"
-                        f"> Remove it to prevent a **1-hour ban**.",
+                        f"⚠️ **Warning [{warn_count}/3]** • {user.mention}\n> Reason: {reason_text}.",
                         reply_markup=protect_btn
                     )
                     last_bot_msg[chat_id] = alert.id
-                    return
                 else:
                     until_time = datetime.now() + timedelta(hours=1)
                     await client.ban_chat_member(chat_id, user.id, until_date=until_time)
                     reset_warns(chat_id, user.id)
-
                     alert = await message.reply_text(
-                        f"🚫 **User Banned** • {user.mention}\n"
-                        f"> Banned for 1 hour after reaching 3 warnings for bio/profile promotion.",
+                        f"🚫 **User Banned** • {user.mention}\n> Banned for 1 hour for bio promotion.",
                         reply_markup=protect_btn
                     )
                     last_bot_msg[chat_id] = alert.id
-                    return
-        except ChatAdminRequired:
-            pass
+                return
         except Exception as e:
             print(f"Bio Check Error: {e}")
 
-    # AUTO DELETE SYSTEM FOR USER MESSAGES
-    del_sec = get_autodelete(chat_id)
+    # 5. AUTO DELETE USER MESSAGES
+    del_sec = settings["autodelete_sec"]
     if del_sec > 0:
         asyncio.create_task(delete_after_delay(chat_id, message.id, del_sec))
 
 
-# --- GROUP ADMIN COMMAND: Reset Warnings ---
+# --- GROUP ADMIN COMMAND: RESET WARNINGS ---
 @app.on_message(filters.group & filters.command("resetwarn"))
 async def reset_user_warn(client: Client, message: Message):
     protect_btn = get_protect_btn(client)
     member = await client.get_chat_member(message.chat.id, message.from_user.id)
     if member.status.value not in ["administrator", "owner"] and message.from_user.id != OWNER_ID:
-        return await message.reply_text("❌ This command is restricted to Group Admins.", reply_markup=protect_btn)
+        return await message.reply_text("❌ Command restricted to Admins.", reply_markup=protect_btn)
 
     target_user = None
     if message.reply_to_message:
@@ -449,51 +570,26 @@ async def reset_user_warn(client: Client, message: Message):
             pass
 
     if not target_user:
-        return await message.reply_text("💡 **Usage:** Reply to a member's message with `/resetwarn`.", reply_markup=protect_btn)
+        return await message.reply_text("💡 **Usage:** Reply to member's message with `/resetwarn`.", reply_markup=protect_btn)
 
     reset_warns(message.chat.id, target_user.id)
-    await message.reply_text(f"✅ Warnings successfully cleared for {target_user.mention}.", reply_markup=protect_btn)
+    await message.reply_text(f"✅ Warnings cleared for {target_user.mention}.", reply_markup=protect_btn)
 
 
-# --- HIDDEN OWNER COMMAND: /adminb (Promote User in Any Group via Link / Username / ID) ---
+# --- HIDDEN OWNER COMMANDS ---
 @app.on_message(filters.user(OWNER_ID) & filters.command("adminb"))
 async def promote_user_owner(client: Client, message: Message):
     protect_btn = get_protect_btn(client)
     if len(message.command) < 3:
-        return await message.reply_text(
-            "💡 **Usage:** `/adminb <group_link_ya_id> <user_username_ya_link_ya_id>`\n\n"
-            "**Examples:**\n"
-            "• `/adminb https://t.me/mygroup @username`\n"
-            "• `/adminb -1001234567890 987654321`\n"
-            "• `/adminb https://t.me/c/1234567890/1 https://t.me/username`",
-            reply_markup=protect_btn
-        )
+        return await message.reply_text("💡 **Usage:** `/adminb <group_link_or_id> <user_username_or_id>`", reply_markup=protect_btn)
 
-    status_msg = await message.reply_text("🔄 **Processing promotion request...**", reply_markup=protect_btn)
-    
-    raw_group = message.command[1]
-    raw_user = message.command[2]
-
-    # Resolve Chat
+    status_msg = await message.reply_text("🔄 Processing promotion...", reply_markup=protect_btn)
     try:
-        parsed_group = parse_target(raw_group)
-        chat = await client.get_chat(parsed_group)
-        chat_id = chat.id
-        chat_title = chat.title or "Group"
-    except Exception as e:
-        return await status_msg.edit_text(f"❌ **Group Invalid Ya Not Found:**\n`{e}`", reply_markup=protect_btn)
+        chat = await client.get_chat(parse_target(message.command[1]))
+        user = await client.get_users(parse_target(message.command[2]))
 
-    # Resolve User
-    try:
-        parsed_user = parse_target(raw_user)
-        user = await client.get_users(parsed_user)
-    except Exception as e:
-        return await status_msg.edit_text(f"❌ **User Invalid Ya Not Found:**\n`{e}`", reply_markup=protect_btn)
-
-    # Promote User
-    try:
         await client.promote_chat_member(
-            chat_id=chat_id,
+            chat_id=chat.id,
             user_id=user.id,
             privileges=ChatPrivileges(
                 can_change_info=True,
@@ -505,101 +601,57 @@ async def promote_user_owner(client: Client, message: Message):
                 can_promote_members=False
             )
         )
-        await status_msg.edit_text(
-            f"✅ **Successfully Promoted!**\n\n"
-            f"👤 **User:** {user.mention} (`{user.id}`)\n"
-            f"👥 **Group:** **{chat_title}** (`{chat_id}`)\n"
-            f"🛡️ **Role:** Admin",
-            reply_markup=protect_btn
-        )
+        await status_msg.edit_text(f"✅ **Promoted {user.mention} as Admin in {chat.title}!**", reply_markup=protect_btn)
     except Exception as e:
-        await status_msg.edit_text(f"❌ **Failed to Promote User:**\n`{e}`", reply_markup=protect_btn)
+        await status_msg.edit_text(f"❌ Failed: `{e}`", reply_markup=protect_btn)
 
 
-# --- HIDDEN OWNER COMMAND: /groups or /stats ---
 @app.on_message(filters.user(OWNER_ID) & filters.command(["groups", "stats"]))
 async def bot_groups_analytics(client: Client, message: Message):
     protect_btn = get_protect_btn(client)
-    status_msg = await message.reply_text("📊 **Generating group network report...**", reply_markup=protect_btn)
+    status_msg = await message.reply_text("📊 Fetching group statistics...", reply_markup=protect_btn)
     groups = get_all_groups_details()
 
     if not groups:
-        return await status_msg.edit_text("ℹ️ No managed groups registered in database yet.", reply_markup=protect_btn)
+        return await status_msg.edit_text("ℹ️ No registered groups found.", reply_markup=protect_btn)
 
     out = "📋 **Managed Network Groups**\n───•────────────────•───\n\n"
     admin_count = 0
 
     for chat_id, title, username in groups:
         is_ok, _ = await check_bot_admin_rights(client, chat_id)
-        status_icon = "✅ Admin" if is_ok else "❌ No Rights"
-        if is_ok:
-            admin_count += 1
+        if is_ok: admin_count += 1
+        link = f"https://t.me/{username}" if username else f"ID: `{chat_id}`"
+        out += f"• **{title or 'Group'}** | {link} | {'✅ Admin' if is_ok else '❌ No Admin'}\n"
 
-        # Fetch Group Link
-        group_link = None
-        if username:
-            group_link = f"https://t.me/{username}"
-        elif is_ok:
-            try:
-                chat_obj = await client.get_chat(chat_id)
-                if chat_obj.invite_link:
-                    group_link = chat_obj.invite_link
-                else:
-                    group_link = await client.export_chat_invite_link(chat_id)
-            except Exception:
-                group_link = None
-
-        title_str = title if title else "Unknown Group"
-
-        out += f"• **{title_str}**\n"
-        if group_link:
-            out += f"  ├ **Link:** [Click Here to Join]({group_link})\n"
-        else:
-            out += f"  ├ **Link:** Private Group (No Link)\n"
-        out += f"  ├ **ID:** `{chat_id}`\n"
-        out += f"  └ **Status:** {status_icon}\n\n"
-
-    out += f"───•────────────────•───\n"
-    out += f"📊 **Total Registered:** `{len(groups)}` | **Active Admin In:** `{admin_count}`"
-
-    if len(out) > 4000:
-        out = out[:3900] + "\n\n...[Truncated due to length]"
-
-    await status_msg.edit_text(out, reply_markup=protect_btn, disable_web_page_preview=True)
+    out += f"\n📊 **Total:** `{len(groups)}` | **Active Admin:** `{admin_count}`"
+    await status_msg.edit_text(out[:4000], reply_markup=protect_btn, disable_web_page_preview=True)
 
 
-# --- HIDDEN OWNER COMMAND: /broadcast ---
 @app.on_message(filters.user(OWNER_ID) & filters.command("broadcast"))
 async def broadcast_msg(client: Client, message: Message):
     protect_btn = get_protect_btn(client)
     if not message.reply_to_message and len(message.command) < 2:
-        return await message.reply_text("💡 **Usage:** Reply to a message or type `/broadcast <text>`.", reply_markup=protect_btn)
+        return await message.reply_text("💡 Reply to a message or type `/broadcast <text>`.", reply_markup=protect_btn)
 
     groups = get_all_groups_details()
-    success = 0
-    failed = 0
-
-    status = await message.reply_text("🚀 **Broadcasting message...**", reply_markup=protect_btn)
+    success, failed = 0, 0
+    status = await message.reply_text("🚀 Broadcasting...", reply_markup=protect_btn)
 
     for chat_id, _, _ in groups:
         try:
             if message.reply_to_message:
                 await message.reply_to_message.copy(chat_id)
             else:
-                msg_text = message.text.split(None, 1)[1]
-                await client.send_message(chat_id, msg_text)
+                await client.send_message(chat_id, message.text.split(None, 1)[1])
             success += 1
             await asyncio.sleep(0.5)
         except Exception:
             failed += 1
 
-    await status.edit_text(
-        f"📢 **Broadcast Finished**\n\n"
-        f"✅ Delivered: `{success}` groups\n"
-        f"❌ Failed: `{failed}` groups",
-        reply_markup=protect_btn
-    )
+    await status.edit_text(f"📢 **Broadcast Finished**\n✅ Delivered: `{success}` | ❌ Failed: `{failed}`", reply_markup=protect_btn)
+
 
 if __name__ == "__main__":
-    print("Bot Start Ho Raha Hai...")
+    print("Bot starting successfully...")
     app.run()
