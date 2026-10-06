@@ -1,12 +1,39 @@
-import os
 import asyncio
+import os
 import re
 import sqlite3
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# --- PYTHON EVENT LOOP FIX ---
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+# --- RENDER PORT BINDING FIX (Dummy Web Server) ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running successfully!")
+
+    def log_message(self, format, *args):
+        return
+
+def start_dummy_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
+# Background Thread me dummy server start karein
+threading.Thread(target=start_dummy_server, daemon=True).start()
+
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.errors import ChatAdminRequired, RPCError
 
-# --- CONFIGURATION (Reads from Environment Variables for Hosting Security) ---
+# --- CONFIGURATION ---
 API_ID = int(os.environ.get("API_ID", "1234567"))
 API_HASH = os.environ.get("API_HASH", "YOUR_API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
