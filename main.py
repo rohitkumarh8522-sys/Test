@@ -12,12 +12,12 @@ try:
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
-# --- RENDER PORT BINDING FIX (Dummy Web Server) ---
+# --- DUMMY WEB SERVER FOR RENDER ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is running 24/7 successfully!")
+        self.wfile.write(b"Bot is online and running smoothly.")
 
     def log_message(self, format, *args):
         return
@@ -45,7 +45,6 @@ app = Client("bio_guard_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TO
 conn = sqlite3.connect("bot_database.db", check_same_thread=False)
 cursor = conn.cursor()
 
-# Group settings table
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS groups (
     chat_id INTEGER PRIMARY KEY,
@@ -53,7 +52,6 @@ CREATE TABLE IF NOT EXISTS groups (
 )
 """)
 
-# User warnings table
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS warnings (
     chat_id INTEGER,
@@ -64,10 +62,9 @@ CREATE TABLE IF NOT EXISTS warnings (
 """)
 conn.commit()
 
-# Bio me Link/Channel detect karne ka Regex
 LINK_PATTERN = re.compile(r'(https?://|t\.me/|telegram\.me/|@[a-zA-Z0-9_]{4,})', re.IGNORECASE)
 
-# --- DATABASE HELPERS ---
+# Database Helper Functions
 def add_group(chat_id):
     cursor.execute("INSERT OR IGNORE INTO groups (chat_id) VALUES (?)", (chat_id,))
     conn.commit()
@@ -97,10 +94,9 @@ def add_warn(chat_id, user_id):
     return current
 
 def reset_warns(chat_id, user_id):
-    cursor.execute("DELETE FROM warnings WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+    cursor.execute("DELETE FROM warnings WHERE chat_id = ? AND user_id = ?", (chat_id,))
     conn.commit()
 
-# --- HELPER FUNCTION: Auto Delete Async Task ---
 async def delete_after_delay(chat_id: int, message_id: int, delay: int):
     await asyncio.sleep(delay)
     try:
@@ -114,31 +110,32 @@ async def delete_after_delay(chat_id: int, message_id: int, delay: int):
 async def start_command(client: Client, message: Message):
     if message.chat.type.value == "private":
         start_text = (
-            "👋 **Namaste! Main Bio Guard & Auto Delete Bot Hu.**\n\n"
-            "🛠 **Mujhe Group Me Kaise Set Karein:**\n"
-            "1. Mujhe apne Telegram Group me Add karein.\n"
-            "2. Mujhe Group Admin banayein aur **Delete Messages** & **Ban Users** permissions dein.\n"
-            "3. Bas! Main automatically active ho jaunga.\n\n"
-            "📋 **Group Admin Commands:**\n"
-            "• `/setdelete <seconds>` - Group ke messages auto-delete ka time set karein (e.g. `/setdelete 60` or `0` for OFF).\n"
-            "• `/resetwarn <user_id/reply>` - User ki warnings reset karne ke liye.\n\n"
-            "👑 **Owner Commands:**\n"
-            "• `/broadcast <message/reply>` - Sabhi groups me broadcast karne ke liye.\n"
-            "• `/groups` ya `/stats` - Active groups aur admin status dekhne ke liye."
+            "🛡️️ **Bio Guard & Auto Delete System**\n"
+            "───•────────────────•───\n\n"
+            "Hello! I am an advanced security bot designed to protect your Telegram groups from bio links/promotions and automatically clean up group chats.\n\n"
+            "⚡ **Key Features:**\n"
+            "• **Bio Protection**: Detects links/channels in user bios and automatically bans spammers after 3 warnings.\n"
+            "• **Auto Delete**: Automatically deletes group messages after a custom time set by admins.\n\n"
+            "⚙️ **Admin Commands:**\n"
+            "• `/setdelete <seconds>` — Set auto-delete timer (e.g., `/setdelete 60` or `0` to turn OFF).\n"
+            "• `/resetwarn` — Reply to a user's message to clear their warnings.\n\n"
+            "📌 **How to Use:**\n"
+            "Add me to your group with **Delete Messages** and **Ban Users** admin permissions."
         )
         buttons = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Add Me To Your Group", url=f"https://t.me/{client.me.username}?startgroup=true")]
         ])
-        await message.reply_text(start_text, reply_markup=buttons)
+        await message.reply_text(start_text, reply_markup=buttons, disable_web_page_preview=True)
     else:
         group_text = (
-            "🤖 **Bio Guard Bot Group Me Active Hai!**\n\n"
-            "⚙️ **Admin Commands:**\n"
-            "• `/setdelete 60` - Auto message delete time set karein (Seconds me).\n"
-            "• `/setdelete 0` - Auto message delete OFF karein.\n"
-            "• `/resetwarn` - Reply karke kisi user ki warning reset karein."
+            "🛡️ **Bio Guard Security Active**\n"
+            "───•────────────────•───\n\n"
+            "⚙️ **Group Commands:**\n"
+            "• `/setdelete <seconds>` — Set auto message deletion delay.\n"
+            "• `/setdelete 0` — Disable auto message deletion.\n"
+            "• `/resetwarn` — Reply to a user to reset their warning count."
         )
-        await message.reply_text(group_text)
+        await message.reply_text(group_text, disable_web_page_preview=True)
 
 
 # --- EVENT: Group Message Processing ---
@@ -152,51 +149,46 @@ async def handle_group_message(client: Client, message: Message):
 
     add_group(chat_id)
 
-    # Check Admin Status
     try:
         member = await client.get_chat_member(chat_id, user.id)
         is_admin = member.status.value in ["administrator", "owner"]
     except Exception:
         is_admin = False
 
-    # --- FEATURE 1: BIO PROTECTION (3 WARNS + 1 HOUR BAN) ---
+    # BIO PROTECTION
     if not is_admin and user.id != OWNER_ID:
         try:
             user_full_info = await client.get_chat(user.id)
             user_bio = user_full_info.bio or ""
 
             if LINK_PATTERN.search(user_bio):
-                # Delete user message
                 await message.delete()
-
                 warn_count = add_warn(chat_id, user.id)
 
                 if warn_count < 3:
                     alert = await message.reply_text(
-                        f"⚠️ **Warning [{warn_count}/3] for {user.mention}!**\n\n"
-                        f"Aapke Telegram Bio me Link ya Channel paya gaya hai.\n"
-                        f"Kripya ise hataayein warna 3 warning hone par aapko **1 Ghante ke liye BAN** kar diya jayega."
+                        f"⚠️ **Warning [{warn_count}/3]** • {user.mention}\n"
+                        f"> Bio contains prohibited links/usernames. Remove it to avoid a **1-hour ban**."
                     )
-                    asyncio.create_task(delete_after_delay(chat_id, alert.id, 10))
+                    asyncio.create_task(delete_after_delay(chat_id, alert.id, 8))
                     return
                 else:
-                    # 3 Warnings Reached -> Ban for 1 Hour (3600 seconds)
                     until_time = datetime.now() + timedelta(hours=1)
                     await client.ban_chat_member(chat_id, user.id, until_date=until_time)
                     reset_warns(chat_id, user.id)
 
                     alert = await message.reply_text(
-                        f"🚫 **{user.mention} ko 1 Ghante ke liye BAN kar diya gaya hai!**\n"
-                        f"Reason: 3/3 Warnings crossed (Bio Link/Channel)."
+                        f"🚫 **User Banned** • {user.mention}\n"
+                        f"> Reached maximum warnings (3/3) for link in bio. Banned for 1 hour."
                     )
-                    asyncio.create_task(delete_after_delay(chat_id, alert.id, 15))
+                    asyncio.create_task(delete_after_delay(chat_id, alert.id, 10))
                     return
         except ChatAdminRequired:
             pass
         except Exception as e:
             print(f"Bio Check Error: {e}")
 
-    # --- FEATURE 2: AUTO MESSAGE DELETE SYSTEM ---
+    # AUTO DELETE
     del_sec = get_autodelete(chat_id)
     if del_sec > 0:
         asyncio.create_task(delete_after_delay(chat_id, message.id, del_sec))
@@ -207,20 +199,20 @@ async def handle_group_message(client: Client, message: Message):
 async def set_delete_time(client: Client, message: Message):
     member = await client.get_chat_member(message.chat.id, message.from_user.id)
     if member.status.value not in ["administrator", "owner"] and message.from_user.id != OWNER_ID:
-        return await message.reply_text("❌ Ye command sirf Group Admins ke liye hai.")
+        return await message.reply_text("❌ This command is restricted to Group Admins.")
 
     if len(message.command) < 2:
-        return await message.reply_text("Usage: `/setdelete 60` (Seconds me time dalein, 0 = OFF)")
+        return await message.reply_text("💡 **Usage:** `/setdelete <seconds>` (e.g., `/setdelete 60` or `0` to disable).")
 
     try:
         seconds = int(message.command[1])
         set_autodelete(message.chat.id, seconds)
         if seconds > 0:
-            await message.reply_text(f"✅ Auto delete set ho gaya: **{seconds} Seconds** baad saare messages delete honge.")
+            await message.reply_text(f"✅ **Auto-Delete Enabled:** Messages will be removed after **{seconds} seconds**.")
         else:
-            await message.reply_text("🚫 Auto message delete OFF kar diya gaya hai.")
+            await message.reply_text("🚫 **Auto-Delete Disabled.**")
     except ValueError:
-        await message.reply_text("❌ Kripya valid number me seconds dalein (e.g. `/setdelete 120`).")
+        await message.reply_text("❌ Please specify time in seconds using numbers (e.g., `/setdelete 120`).")
 
 
 # --- GROUP ADMIN COMMAND: Reset Warnings ---
@@ -228,7 +220,7 @@ async def set_delete_time(client: Client, message: Message):
 async def reset_user_warn(client: Client, message: Message):
     member = await client.get_chat_member(message.chat.id, message.from_user.id)
     if member.status.value not in ["administrator", "owner"] and message.from_user.id != OWNER_ID:
-        return await message.reply_text("❌ Ye command sirf Group Admins ke liye hai.")
+        return await message.reply_text("❌ This command is restricted to Group Admins.")
 
     target_user = None
     if message.reply_to_message:
@@ -240,23 +232,23 @@ async def reset_user_warn(client: Client, message: Message):
             pass
 
     if not target_user:
-        return await message.reply_text("Usage: Kisi user ke message ko reply karke `/resetwarn` likhein.")
+        return await message.reply_text("💡 **Usage:** Reply to a user's message with `/resetwarn`.")
 
     reset_warns(message.chat.id, target_user.id)
-    await message.reply_text(f"✅ **{target_user.mention}** ki saari warnings reset kar di gayi hain.")
+    await message.reply_text(f"✅ Warnings cleared for {target_user.mention}.")
 
 
-# --- OWNER COMMAND: BROADCAST ---
+# --- HIDDEN OWNER COMMAND: BROADCAST ---
 @app.on_message(filters.user(OWNER_ID) & filters.command("broadcast"))
 async def broadcast_msg(client: Client, message: Message):
     if not message.reply_to_message and len(message.command) < 2:
-        return await message.reply_text("Usage: `/broadcast Hello` ya kisi message/link ko reply karke `/broadcast` likhein.")
+        return await message.reply_text("💡 **Usage:** Reply to a message or type `/broadcast <message>`.")
 
     groups = get_all_groups()
     success = 0
     failed = 0
 
-    status = await message.reply_text("🚀 Broadcast shuru ho raha hai...")
+    status = await message.reply_text("🚀 **Broadcasting message...**")
 
     for g_id in groups:
         try:
@@ -270,14 +262,18 @@ async def broadcast_msg(client: Client, message: Message):
         except Exception:
             failed += 1
 
-    await status.edit_text(f"📢 **Broadcast Complete!**\n\n✅ Sent to: `{success}` Groups\n❌ Failed/Kicked: `{failed}` Groups")
+    await status.edit_text(
+        f"📢 **Broadcast Finished**\n\n"
+        f"✅ Delivered: `{success}` groups\n"
+        f"❌ Failed: `{failed}` groups"
+    )
 
 
-# --- OWNER COMMAND: GROUPS & STATS ---
+# --- HIDDEN OWNER COMMAND: STATS / GROUPS ---
 @app.on_message(filters.user(OWNER_ID) & filters.command(["groups", "stats"]))
 async def bot_stats(client: Client, message: Message):
     groups = get_all_groups()
-    status_msg = await message.reply_text("📊 Groups details calculate ho rahi hain...")
+    status_msg = await message.reply_text("📊 **Fetching analytics...**")
     
     admin_count = 0
     total_groups = len(groups)
@@ -291,9 +287,10 @@ async def bot_stats(client: Client, message: Message):
             pass
 
     await status_msg.edit_text(
-        f"🤖 **Bot Group Statistics:**\n\n"
-        f"👥 Total Groups Added: `{total_groups}`\n"
-        f"👑 Admin Rights Available In: `{admin_count}` Groups"
+        f"📊 **System Status**\n"
+        f"───•────────────────•───\n\n"
+        f"👥 **Total Groups:** `{total_groups}`\n"
+        f"👑 **Admin Privileges:** `{admin_count}` groups"
     )
 
 if __name__ == "__main__":
