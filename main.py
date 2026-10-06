@@ -91,7 +91,6 @@ CREATE TABLE IF NOT EXISTS groups (
 )
 """)
 
-# Safe schema migrations for existing DB columns
 db_columns = [
     "forward_protect INTEGER DEFAULT 1",
     "nolinks INTEGER DEFAULT 1",
@@ -253,28 +252,37 @@ async def check_bot_admin_rights(client: Client, chat_id: int):
         return False, str(e)
 
 
-# --- COMMAND: /start & /help ---
+# --- COMMAND: /start & /help (PROTECTRON EXACT LAYOUT) ---
 @app.on_message(filters.command(["start", "help"]))
 async def start_command(client: Client, message: Message):
     protect_btn = get_protect_btn(client)
-    user_name = message.from_user.first_name if message.from_user else "User"
+    bot_username = client.me.username
 
     start_text = (
-        f"👑 **{user_name}**, I am an advanced Group Protection & Management Bot!\n\n"
-        f"**How to setup in group?**\n"
-        f"1) Add **@{client.me.username}** to your group.\n"
-        f"2) Make bot Admin with Delete Messages & Ban Users rights.\n"
-        f"3) Use **/status** to view & toggle group filters.\n\n"
-        f"📌 **Group Filter Commands:**\n"
-        f"• `/antispam` • `/antispam_mode` • `/imagefilter` • `/noevents` \n"
-        f"• `/nolinks` • `/noforwards` • `/nolocations` • `/nocontacts` \n"
-        f"• `/nocommands` • `/nohashtags` • `/novoice` • `/nobots` \n"
-        f"• `/antiflood` • `/profanity` • `/bioscanner` • `/welcome` \n"
-        f"• `/autodelete`\n\n"
-        f"🛠️ **Admin Moderation:**\n"
-        f"• `/ban`, `/unban`, `/kick`, `/mute`, `/unmute`\n"
-        f"• `/warn`, `/resetwarn`, `/purge`\n"
-        f"• `/badwords`, `/addword`, `/rmword`"
+        f"Blacklist words and domains; remove profanity and flood messages; "
+        f"restrict permissions for spammers; stop members from adding spam bots to your group.\n\n"
+        f"**How to start using bot?**\n"
+        f"1) Add @{bot_username} to your group.\n"
+        f"2) Assign admin permissions (delete messages, ban users).\n"
+        f"3) Run /start command in the group.\n"
+        f"4) Change settings using /status.\n\n"
+        f"/antispam - Filter unwanted advertising and restrict spammers.\n"
+        f"/antispam_mode - Simple Mode (checks new members only), Advanced Mode (neural network 🧠, more accurate and strict).\n\n"
+        f"/imagefilter - Filter unsafe image files and photos.\n"
+        f"/noevents - Filter \"X joined or left the group\" notifications.\n"
+        f"/nobots - Protect your group from users who invite spam bots.\n"
+        f"/nolinks - Filter messages with links, mentions of unknown members, reply markup.\n"
+        f"/noforwards - Filter messages with a mention of any participants or forwarded posts.\n"
+        f"/nocontacts - Filter messages with contact numbers of users.\n"
+        f"/nolocations - Filter messages containing user locations.\n"
+        f"/nocommands - Filter commands sent by non-admin members.\n"
+        f"/nohashtags - Filter messages containing hashtags.\n"
+        f"/novoice - Filter voice notes and audio messages.\n"
+        f"/antiflood - Limit frequent messages and flood.\n"
+        f"/profanity - Filter bad words and abusive messages.\n"
+        f"/bioscanner - Scan bio for promotional links and channels.\n"
+        f"/welcome - Toggle welcome message for new chat members.\n"
+        f"/autodelete - Auto delete messages timer setting."
     )
     await message.reply_text(start_text, reply_markup=protect_btn, disable_web_page_preview=True)
 
@@ -724,12 +732,11 @@ async def handle_group_message(client: Client, message: Message):
 
     settings = get_group_settings(chat_id)
 
-    # 1. FORWARD PROTECTION (UPDATED: DELETE + WARN + MUTE USER)
+    # 1. FORWARD PROTECTION (DELETE + WARN + MUTE USER)
     is_forwarded = bool(message.forward_date or message.forward_from or message.forward_from_chat or message.forward_sender_name)
     if settings["forward_protect"] == 1 and is_forwarded:
         try:
             await message.delete()
-            # Mute the user immediately
             await client.restrict_chat_member(chat_id, user.id, ChatPermissions())
             warn_count = add_warn(chat_id, user.id)
             
@@ -812,7 +819,7 @@ async def handle_group_message(client: Client, message: Message):
             await message.delete()
             warn_count = add_warn(chat_id, user.id)
             await delete_previous_bot_msg(chat_id)
-            alert_text = format_alert_text("hashtag **Hashtag Removed**", user, "Using hashtags is not allowed", warn_count)
+            alert_text = format_alert_text("#️⃣ **Hashtag Removed**", user, "Using hashtags is not allowed", warn_count)
             alert = await message.reply_text(alert_text, reply_markup=protect_btn)
             last_bot_msg[chat_id] = alert.id
             return
