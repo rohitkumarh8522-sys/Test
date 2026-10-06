@@ -42,6 +42,9 @@ OWNER_ID = int(os.environ.get("OWNER_ID", "123456789"))
 
 app = Client("bio_guard_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
+# --- TRACK LAST BOT WARNING MESSAGE PER GROUP ---
+last_bot_msg = {}
+
 # --- DATABASE SETUP ---
 conn = sqlite3.connect("bot_database.db", check_same_thread=False)
 cursor = conn.cursor()
@@ -140,6 +143,13 @@ async def delete_after_delay(chat_id: int, message_id: int, delay: int):
     except Exception:
         pass
 
+async def delete_previous_bot_msg(chat_id: int):
+    if chat_id in last_bot_msg:
+        try:
+            await app.delete_messages(chat_id, last_bot_msg[chat_id])
+        except Exception:
+            pass
+
 # --- ADMIN PERMISSION CHECKER ---
 async def check_bot_admin_rights(client: Client, chat_id: int):
     try:
@@ -171,14 +181,14 @@ async def start_command(client: Client, message: Message):
             "⚙️ **Group Admin Commands:**\n"
             "• `/status` — Check bot health, latency & protection status.\n"
             "• `/forwardprotect <on/off>` — Block forwarded messages in group.\n"
-            "• `/setdelete <seconds>` — Configure message auto-delete timer (e.g. `/setdelete 60` or `0` to turn OFF).\n"
+            "• `/autodelete <on/off/seconds>` — Enable/disable or set timer for auto deletion.\n"
             "• `/resetwarn` — Reply to a member to reset their active warnings.\n\n"
             "📌 **Setup Guide:**\n"
             "1. Add me to your group.\n"
             "2. Promote me to **Admin** with **Delete Messages** & **Ban Users** permissions."
         )
         buttons = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add To Your Group", url=f"https://t.me/{client.me.username}?startgroup=true")]
+            [InlineKeyboardButton("Protect your group 🛡️", url=f"https://t.me/{client.me.username}?startgroup=true")]
         ])
         await message.reply_text(start_text, reply_markup=buttons, disable_web_page_preview=True)
     else:
@@ -188,7 +198,7 @@ async def start_command(client: Client, message: Message):
             "⚙️ **Available Admin Commands:**\n"
             "• `/status` — View system latency & active privileges.\n"
             "• `/forwardprotect <on/off>` — Enable/disable forward message blocker.\n"
-            "• `/setdelete <seconds>` — Set auto-delete duration.\n"
+            "• `/autodelete <on/off/seconds>` — Turn auto-delete ON/OFF or set seconds.\n"
             "• `/resetwarn` — Reset warning counts for a user."
         )
         await message.reply_text(group_text, disable_web_page_preview=True)
@@ -209,7 +219,7 @@ async def group_status(client: Client, message: Message):
     admin_str = "✅ Active & Operational" if is_ok else f"⚠️ Permission Error: {reason}"
     
     auto_del = get_autodelete(message.chat.id)
-    auto_del_str = f"{auto_del} Seconds" if auto_del > 0 else "Disabled"
+    auto_del_str = f"{auto_del} Seconds" if auto_del > 0 else "Disabled ❌"
 
     fwd_prot = get_forward_protect(message.chat.id)
     fwd_str = "ENABLED ✅" if fwd_prot == 1 else "DISABLED ❌"
@@ -222,7 +232,7 @@ async def group_status(client: Client, message: Message):
         f"🚫 **Forward Protection:** `{fwd_str}`\n"
         f"⏱️ **Auto Delete:** `{auto_del_str}`\n"
         f"⚡ **Server Latency:** `{latency} ms`\n\n"
-        f"💡 *Use `/forwardprotect on/off` & `/setdelete <sec>` to configure.*"
+        f"💡 *Use `/forwardprotect on/off` & `/autodelete on/off` to configure.*"
     )
     await status_msg.edit_text(status_text)
 
@@ -253,6 +263,47 @@ async def toggle_forward_protection(client: Client, message: Message):
         await message.reply_text("❌ Invalid argument! Use `/forwardprotect on` or `/forwardprotect off`.")
 
 
+# --- GROUP ADMIN COMMAND: Set or Toggle Auto Delete ---
+@app.on_message(filters.group & filters.command(["setdelete", "autodelete"]))
+async def set_delete_time(client: Client, message: Message):
+    member = await client.get_chat_member(message.chat.id, message.from_user.id)
+    if member.status.value not in ["administrator", "owner"] and message.from_user.id != OWNER_ID:
+        return await message.reply_text("❌ This command is restricted to Group Admins.")
+
+    if len(message.command) < 2:
+        curr = get_autodelete(message.chat.id)
+        status_str = f"{curr} Seconds ✅" if curr > 0 else "DISABLED ❌"
+        return await message.reply_text(
+            f"💡 **Usage:**\n"
+            f"• `/autodelete on` — Enable with default (60s)\n"
+            f"• `/autodelete off` — Disable auto delete\n"
+            f"• `/autodelete <seconds>` — Custom duration (e.g. `/autodelete 30`)\n\n"
+            f"⏱️ **Current Auto Delete:** `{status_str}`"
+        )
+
+    arg = message.command[1].lower()
+    if arg in ["off", "disable", "no"]:
+        set_autodelete(message.chat.id, 0)
+        await message.reply_text("🚫 **Auto-Delete Disabled.**")
+    elif arg in ["on", "enable", "yes"]:
+        curr = get_autodelete(message.chat.id)
+        sec = curr if curr > 0 else 60
+        set_autodelete(message.chat.id, sec)
+        await message.reply_text(f"✅ **Auto-Delete Enabled:** Messages will be removed after **{sec} seconds**.")
+    else:
+        try:
+            seconds = int(arg)
+            if seconds < 0:
+                raise ValueError()
+            set_autodelete(message.chat.id, seconds)
+            if seconds > 0:
+                await message.reply_text(f"✅ **Auto-Delete Enabled:** Messages will be removed after **{seconds} seconds**.")
+            else:
+                await message.reply_text("🚫 **Auto-Delete Disabled.**")
+        except ValueError:
+            await message.reply_text("❌ Please specify 'on', 'off', or duration in seconds (e.g. `/autodelete 120`).")
+
+
 # --- EVENT: Group Message Processing ---
 @app.on_message(filters.group & ~filters.service)
 async def handle_group_message(client: Client, message: Message):
@@ -271,13 +322,14 @@ async def handle_group_message(client: Client, message: Message):
     # If bot is not admin and someone triggers commands, show warning
     if not is_bot_admin:
         if message.text and message.text.startswith("/"):
+            await delete_previous_bot_msg(chat_id)
             warn_msg = await message.reply_text(
                 "⚠️ **Admin Rights Required!**\n"
                 "───•────────────────•───\n"
                 "> Bot is disabled in this group because it lacks **Admin Rights**.\n\n"
                 "Please promote the bot to Admin with **Delete Messages** and **Ban Users** permissions to activate security."
             )
-            asyncio.create_task(delete_after_delay(chat_id, warn_msg.id, 12))
+            last_bot_msg[chat_id] = warn_msg.id
         return
 
     # Check User Admin Status
@@ -293,11 +345,12 @@ async def handle_group_message(client: Client, message: Message):
         if is_forwarded and get_forward_protect(chat_id) == 1:
             try:
                 await message.delete()
+                await delete_previous_bot_msg(chat_id)
                 alert = await message.reply_text(
                     f"🚫 **Forwarded Message Removed** • {user.mention}\n"
                     f"> Forwarding messages is restricted in this group."
                 )
-                asyncio.create_task(delete_after_delay(chat_id, alert.id, 6))
+                last_bot_msg[chat_id] = alert.id
                 return
             except Exception as e:
                 print(f"Forward Delete Error: {e}")
@@ -312,12 +365,19 @@ async def handle_group_message(client: Client, message: Message):
                 await message.delete()
                 warn_count = add_warn(chat_id, user.id)
 
+                protect_btn = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Protect your group 🛡️", url=f"https://t.me/{client.me.username}?startgroup=true")]
+                ])
+
+                await delete_previous_bot_msg(chat_id)
+
                 if warn_count < 3:
                     alert = await message.reply_text(
                         f"⚠️ **Warning [{warn_count}/3]** • {user.mention}\n"
-                        f"> Bio contains prohibited link/username. Remove it to prevent a **1-hour ban**."
+                        f"> Bio contains prohibited link/username. Remove it to prevent a **1-hour ban**.",
+                        reply_markup=protect_btn
                     )
-                    asyncio.create_task(delete_after_delay(chat_id, alert.id, 8))
+                    last_bot_msg[chat_id] = alert.id
                     return
                 else:
                     until_time = datetime.now() + timedelta(hours=1)
@@ -326,40 +386,20 @@ async def handle_group_message(client: Client, message: Message):
 
                     alert = await message.reply_text(
                         f"🚫 **User Banned** • {user.mention}\n"
-                        f"> Banned for 1 hour after reaching 3 warnings for bio promotion link."
+                        f"> Banned for 1 hour after reaching 3 warnings for bio promotion link.",
+                        reply_markup=protect_btn
                     )
-                    asyncio.create_task(delete_after_delay(chat_id, alert.id, 10))
+                    last_bot_msg[chat_id] = alert.id
                     return
         except ChatAdminRequired:
             pass
         except Exception as e:
             print(f"Bio Check Error: {e}")
 
-    # AUTO DELETE SYSTEM
+    # AUTO DELETE SYSTEM FOR USER MESSAGES
     del_sec = get_autodelete(chat_id)
     if del_sec > 0:
         asyncio.create_task(delete_after_delay(chat_id, message.id, del_sec))
-
-
-# --- GROUP ADMIN COMMAND: Set Auto Delete ---
-@app.on_message(filters.group & filters.command("setdelete"))
-async def set_delete_time(client: Client, message: Message):
-    member = await client.get_chat_member(message.chat.id, message.from_user.id)
-    if member.status.value not in ["administrator", "owner"] and message.from_user.id != OWNER_ID:
-        return await message.reply_text("❌ This command is restricted to Group Admins.")
-
-    if len(message.command) < 2:
-        return await message.reply_text("💡 **Usage:** `/setdelete <seconds>` (e.g., `/setdelete 60` or `0` to disable).")
-
-    try:
-        seconds = int(message.command[1])
-        set_autodelete(message.chat.id, seconds)
-        if seconds > 0:
-            await message.reply_text(f"✅ **Auto-Delete Enabled:** Messages will be removed after **{seconds} seconds**.")
-        else:
-            await message.reply_text("🚫 **Auto-Delete Disabled.**")
-    except ValueError:
-        await message.reply_text("❌ Please specify duration in numerical seconds (e.g., `/setdelete 120`).")
 
 
 # --- GROUP ADMIN COMMAND: Reset Warnings ---
