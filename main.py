@@ -214,7 +214,7 @@ def add_custom_bad_word(chat_id, word):
     conn.commit()
 
 def remove_custom_bad_word(chat_id, word):
-    cursor.execute("DELETE FROM badwords WHERE chat_id = ? AND word = ?", (chat_id, word.lower()))
+    cursor.execute("DELETE FROM badwords WHERE chat_id = ?", (chat_id, word.lower()))
     conn.commit()
 
 def get_group_bad_words(chat_id):
@@ -252,7 +252,35 @@ async def check_bot_admin_rights(client: Client, chat_id: int):
         return False, str(e)
 
 
-# --- COMMAND: /start & /help (PROTECTRON EXACT LAYOUT) ---
+# --- UNIFIED WARNING AND AUTO-MUTE PROCESSOR ---
+async def process_violation(client: Client, message: Message, user, reason: str, header: str):
+    chat_id = message.chat.id
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    warn_count = add_warn(chat_id, user.id)
+    await delete_previous_bot_msg(chat_id)
+
+    if warn_count < 3:
+        alert_text = format_alert_text(header, user, reason, warn_count)
+        alert = await message.reply_text(alert_text, reply_markup=get_protect_btn(client))
+        last_bot_msg[chat_id] = alert.id
+    else:
+        try:
+            # MUTE user completely
+            await client.restrict_chat_member(chat_id, user.id, ChatPermissions())
+        except Exception as e:
+            print(f"Failed to mute user: {e}")
+
+        reset_warns(chat_id, user.id)
+        alert_text = format_alert_text("🔇 **User Auto-Muted**", user, f"Reached 3/3 warnings ({reason})", 3)
+        alert = await message.reply_text(alert_text, reply_markup=get_protect_btn(client))
+        last_bot_msg[chat_id] = alert.id
+
+
+# --- COMMAND: /start & /help ---
 @app.on_message(filters.command(["start", "help"]))
 async def start_command(client: Client, message: Message):
     protect_btn = get_protect_btn(client)
@@ -624,10 +652,9 @@ async def manual_warn_cmd(client: Client, message: Message):
         alert_text = format_alert_text("⚠️ **Manual Warning Added**", target, reason, warn_count)
         await message.reply_text(alert_text, reply_markup=protect_btn)
     else:
-        until_time = datetime.now() + timedelta(hours=1)
-        await client.ban_chat_member(message.chat.id, target.id, until_date=until_time)
+        await client.restrict_chat_member(message.chat.id, target.id, ChatPermissions())
         reset_warns(message.chat.id, target.id)
-        alert_text = format_alert_text("🚫 **User Auto-Banned**", target, "Reached maximum 3/3 warnings", 3)
+        alert_text = format_alert_text("🔇 **User Auto-Muted**", target, "Reached maximum 3/3 warnings", 3)
         await message.reply_text(alert_text, reply_markup=protect_btn)
 
 @app.on_message(filters.group & filters.command("resetwarn"))
@@ -732,78 +759,46 @@ async def handle_group_message(client: Client, message: Message):
 
     settings = get_group_settings(chat_id)
 
-    # 1. FORWARD PROTECTION (DELETE + WARN + MUTE USER)
+    # 1. FORWARD PROTECTION (WARNING + AUTO MUTE ON 3/3)
     is_forwarded = bool(message.forward_date or message.forward_from or message.forward_from_chat or message.forward_sender_name)
     if settings["forward_protect"] == 1 and is_forwarded:
-        try:
-            await message.delete()
-            await client.restrict_chat_member(chat_id, user.id, ChatPermissions())
-            warn_count = add_warn(chat_id, user.id)
-            
-            await delete_previous_bot_msg(chat_id)
-            alert_text = format_alert_text(
-                "⏩ **Forward Message Removed & User Muted**", 
-                user, 
-                "Forwarding messages is strictly restricted in this group", 
-                warn_count
-            )
-            alert = await message.reply_text(alert_text, reply_markup=protect_btn)
-            last_bot_msg[chat_id] = alert.id
-            return
-        except Exception as e:
-            print(f"Forward delete error: {e}")
+        return await process_violation(
+            client, message, user, 
+            "Forwarding messages is strictly restricted in this group", 
+            "⏩ **Forward Message Removed**"
+        )
 
     # 2. IMAGE FILTER
     if settings["imagefilter"] == 1 and message.photo:
-        try:
-            await message.delete()
-            warn_count = add_warn(chat_id, user.id)
-            await delete_previous_bot_msg(chat_id)
-            alert_text = format_alert_text("🖼️ **Image Removed**", user, "Sending images is forbidden in this group", warn_count)
-            alert = await message.reply_text(alert_text, reply_markup=protect_btn)
-            last_bot_msg[chat_id] = alert.id
-            return
-        except Exception as e:
-            print(f"Image filter error: {e}")
+        return await process_violation(
+            client, message, user, 
+            "Sending images is forbidden in this group", 
+            "🖼️ **Image Removed**"
+        )
 
     # 3. VOICE FILTER
     if settings["novoice"] == 1 and (message.voice or message.audio):
-        try:
-            await message.delete()
-            warn_count = add_warn(chat_id, user.id)
-            await delete_previous_bot_msg(chat_id)
-            alert_text = format_alert_text("🎙️ **Voice Note Removed**", user, "Sending voice messages is forbidden", warn_count)
-            alert = await message.reply_text(alert_text, reply_markup=protect_btn)
-            last_bot_msg[chat_id] = alert.id
-            return
-        except Exception as e:
-            print(f"Voice filter error: {e}")
+        return await process_violation(
+            client, message, user, 
+            "Sending voice messages is forbidden", 
+            "🎙️ **Voice Note Removed**"
+        )
 
     # 4. CONTACTS FILTER
     if settings["nocontacts"] == 1 and message.contact:
-        try:
-            await message.delete()
-            warn_count = add_warn(chat_id, user.id)
-            await delete_previous_bot_msg(chat_id)
-            alert_text = format_alert_text("📇 **Contact Sharing Removed**", user, "Sharing contact cards is restricted", warn_count)
-            alert = await message.reply_text(alert_text, reply_markup=protect_btn)
-            last_bot_msg[chat_id] = alert.id
-            return
-        except Exception as e:
-            print(f"Contact filter error: {e}")
+        return await process_violation(
+            client, message, user, 
+            "Sharing contact cards is restricted", 
+            "📇 **Contact Sharing Removed**"
+        )
 
     # 5. LOCATIONS FILTER
     if settings["nolocations"] == 1 and (message.location or message.venue):
-        try:
-            await message.delete()
-            warn_count = add_warn(chat_id, user.id)
-            await delete_previous_bot_msg(chat_id)
-            alert_text = format_alert_text("📍 **Location Sharing Removed**", user, "Sharing location is restricted", warn_count)
-            alert = await message.reply_text(alert_text, reply_markup=protect_btn)
-            last_bot_msg[chat_id] = alert.id
-            return
-        except Exception as e:
-            print(f"Location filter error: {e}")
+        return await process_violation(
+            client, message, user, 
+            "Sharing location is restricted", 
+            "📍 **Location Sharing Removed**"
+        )
 
     # 6. COMMANDS FILTER (For non-admin users)
     if settings["nocommands"] == 1 and message.text and message.text.startswith("/"):
@@ -815,16 +810,11 @@ async def handle_group_message(client: Client, message: Message):
 
     # 7. HASHTAGS FILTER
     if settings["nohashtags"] == 1 and message.text and "#" in message.text:
-        try:
-            await message.delete()
-            warn_count = add_warn(chat_id, user.id)
-            await delete_previous_bot_msg(chat_id)
-            alert_text = format_alert_text("#️⃣ **Hashtag Removed**", user, "Using hashtags is not allowed", warn_count)
-            alert = await message.reply_text(alert_text, reply_markup=protect_btn)
-            last_bot_msg[chat_id] = alert.id
-            return
-        except Exception as e:
-            print(f"Hashtag filter error: {e}")
+        return await process_violation(
+            client, message, user, 
+            "Using hashtags is not allowed", 
+            "#️⃣ **Hashtag Removed**"
+        )
 
     # 8. BAD WORDS / PROFANITY FILTER
     if settings["profanity_filter"] == 1 and message.text:
@@ -833,38 +823,19 @@ async def handle_group_message(client: Client, message: Message):
         has_bad_word = any(re.search(rf'\b{re.escape(w)}\b', text_lower) for w in bad_words_list)
 
         if has_bad_word:
-            try:
-                await message.delete()
-                warn_count = add_warn(chat_id, user.id)
-                await delete_previous_bot_msg(chat_id)
-
-                if warn_count < 3:
-                    alert_text = format_alert_text("🤬 **Bad Words Detected**", user, "Using abusive language", warn_count)
-                    alert = await message.reply_text(alert_text, reply_markup=protect_btn)
-                    last_bot_msg[chat_id] = alert.id
-                else:
-                    until_time = datetime.now() + timedelta(hours=1)
-                    await client.ban_chat_member(chat_id, user.id, until_date=until_time)
-                    reset_warns(chat_id, user.id)
-                    alert_text = format_alert_text("🚫 **User Banned**", user, "1 hour tempban for repeated bad words", 3)
-                    alert = await message.reply_text(alert_text, reply_markup=protect_btn)
-                    last_bot_msg[chat_id] = alert.id
-                return
-            except Exception as e:
-                print(f"Profanity error: {e}")
+            return await process_violation(
+                client, message, user, 
+                "Using abusive language or bad words", 
+                "🤬 **Bad Words Detected**"
+            )
 
     # 9. MESSAGE LINKS FILTER
     if settings["nolinks"] == 1 and message.text and LINK_PATTERN.search(message.text):
-        try:
-            await message.delete()
-            warn_count = add_warn(chat_id, user.id)
-            await delete_previous_bot_msg(chat_id)
-            alert_text = format_alert_text("🔗 **Link Removed**", user, "Posting promotional links/handles is forbidden", warn_count)
-            alert = await message.reply_text(alert_text, reply_markup=protect_btn)
-            last_bot_msg[chat_id] = alert.id
-            return
-        except Exception as e:
-            print(f"Link delete error: {e}")
+        return await process_violation(
+            client, message, user, 
+            "Posting promotional links or handles is forbidden", 
+            "🔗 **Link Removed**"
+        )
 
     # 10. BIO & PROFILE CHANNEL SCANNER
     if settings["bio_scanner"] == 1:
@@ -887,24 +858,12 @@ async def handle_group_message(client: Client, message: Message):
                 has_link = True
 
             if has_link or has_personal_channel:
-                await message.delete()
-                warn_count = add_warn(chat_id, user.id)
-                await delete_previous_bot_msg(chat_id)
-
                 reason_text = "Personal channel attached in bio" if has_personal_channel else "Link/Promotional handle found in bio"
-
-                if warn_count < 3:
-                    alert_text = format_alert_text("⚠️ **Bio Scanner Warning**", user, reason_text, warn_count)
-                    alert = await message.reply_text(alert_text, reply_markup=protect_btn)
-                    last_bot_msg[chat_id] = alert.id
-                else:
-                    until_time = datetime.now() + timedelta(hours=1)
-                    await client.ban_chat_member(chat_id, user.id, until_date=until_time)
-                    reset_warns(chat_id, user.id)
-                    alert_text = format_alert_text("🚫 **User Banned**", user, "1 hour ban for promotional bio", 3)
-                    alert = await message.reply_text(alert_text, reply_markup=protect_btn)
-                    last_bot_msg[chat_id] = alert.id
-                return
+                return await process_violation(
+                    client, message, user, 
+                    reason_text, 
+                    "⚠️ **Bio Scanner Warning**"
+                )
         except Exception as e:
             print(f"Bio Check Error: {e}")
 
