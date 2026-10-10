@@ -206,7 +206,7 @@ def add_warn(chat_id, user_id):
     return current
 
 def reset_warns(chat_id, user_id):
-    cursor.execute("DELETE FROM warnings WHERE chat_id = ? AND user_id = ?", (chat_id,))
+    cursor.execute("DELETE FROM warnings WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
     conn.commit()
 
 def add_custom_bad_word(chat_id, word):
@@ -214,7 +214,7 @@ def add_custom_bad_word(chat_id, word):
     conn.commit()
 
 def remove_custom_bad_word(chat_id, word):
-    cursor.execute("DELETE FROM badwords WHERE chat_id = ?", (chat_id, word.lower()))
+    cursor.execute("DELETE FROM badwords WHERE chat_id = ? AND word = ?", (chat_id, word.lower()))
     conn.commit()
 
 def get_group_bad_words(chat_id):
@@ -252,7 +252,7 @@ async def check_bot_admin_rights(client: Client, chat_id: int):
         return False, str(e)
 
 
-# --- UNIFIED WARNING AND AUTO-MUTE PROCESSOR ---
+# --- UNIFIED WARNING AND AUTO-MUTE PROCESSOR (1 HOUR MUTE ON 3 WARNS) ---
 async def process_violation(client: Client, message: Message, user, reason: str, header: str):
     chat_id = message.chat.id
     try:
@@ -269,13 +269,13 @@ async def process_violation(client: Client, message: Message, user, reason: str,
         last_bot_msg[chat_id] = alert.id
     else:
         try:
-            # MUTE user completely
-            await client.restrict_chat_member(chat_id, user.id, ChatPermissions())
+            until_time = datetime.now() + timedelta(hours=1)
+            await client.restrict_chat_member(chat_id, user.id, ChatPermissions(), until_date=until_time)
         except Exception as e:
             print(f"Failed to mute user: {e}")
 
         reset_warns(chat_id, user.id)
-        alert_text = format_alert_text("🔇 **User Auto-Muted**", user, f"Reached 3/3 warnings ({reason})", 3)
+        alert_text = format_alert_text("🔇 **User Auto-Muted (1 Hour)**", user, f"Reached 3/3 warnings ({reason})", 3)
         alert = await message.reply_text(alert_text, reply_markup=get_protect_btn(client))
         last_bot_msg[chat_id] = alert.id
 
@@ -353,7 +353,7 @@ async def group_status(client: Client, message: Message):
         f"{icon(s['nolinks'])} Links filter `/nolinks`\n"
         f"{icon(s['forward_protect'])} Forwards filter `/noforwards`\n"
         f"{icon(s['nolocations'])} Locations filter `/nolocations`\n"
-        f"{icon(s['nocontacts'])} Contacts filter `/nocontacts`\n"
+        f"{icon(s['nocontacts'])} Contacts filter `/nolocations`\n"
         f"{icon(s['nocommands'])} Commands filter `/nocommands`\n"
         f"{icon(s['nohashtags'])} Hashtags filter `/nohashtags`\n"
         f"{icon(s['novoice'])} Voice filter `/novoice`\n"
@@ -652,9 +652,10 @@ async def manual_warn_cmd(client: Client, message: Message):
         alert_text = format_alert_text("⚠️ **Manual Warning Added**", target, reason, warn_count)
         await message.reply_text(alert_text, reply_markup=protect_btn)
     else:
-        await client.restrict_chat_member(message.chat.id, target.id, ChatPermissions())
+        until_time = datetime.now() + timedelta(hours=1)
+        await client.restrict_chat_member(message.chat.id, target.id, ChatPermissions(), until_date=until_time)
         reset_warns(message.chat.id, target.id)
-        alert_text = format_alert_text("🔇 **User Auto-Muted**", target, "Reached maximum 3/3 warnings", 3)
+        alert_text = format_alert_text("🔇 **User Auto-Muted (1 Hour)**", target, "Reached maximum 3/3 warnings", 3)
         await message.reply_text(alert_text, reply_markup=protect_btn)
 
 @app.on_message(filters.group & filters.command("resetwarn"))
@@ -913,15 +914,11 @@ async def bot_groups_analytics(client: Client, message: Message):
         return await status_msg.edit_text("ℹ️ No registered groups found.", reply_markup=protect_btn)
 
     out = "📋 **Managed Network Groups**\n───•────────────────•───\n\n"
-    admin_count = 0
-
     for chat_id, title, username in groups:
-        is_ok, _ = await check_bot_admin_rights(client, chat_id)
-        if is_ok: admin_count += 1
         link = f"https://t.me/{username}" if username else f"ID: `{chat_id}`"
-        out += f"• **{title or 'Group'}** | {link} | {'✅ Admin' if is_ok else '❌ No Admin'}\n"
+        out += f"• **{title or 'Group'}** | {link}\n"
 
-    out += f"\n📊 **Total:** `{len(groups)}` | **Active Admin:** `{admin_count}`"
+    out += f"\n📊 **Total Groups:** `{len(groups)}`"
     await status_msg.edit_text(out[:4000], reply_markup=protect_btn, disable_web_page_preview=True)
 
 
