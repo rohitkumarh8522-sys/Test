@@ -236,7 +236,7 @@ async def delete_previous_bot_msg(chat_id: int):
         except Exception:
             pass
 
-# --- AUTOMATIC GROUP TRACKER ---
+# --- AUTOMATIC GROUP TRACKER (TRACKS WHEN BOT IS ADDED/REMOVED) ---
 @app.on_my_chat_member()
 async def track_bot_chats(client: Client, update: ChatMemberUpdated):
     chat = update.chat
@@ -266,7 +266,7 @@ async def check_bot_admin_rights(client: Client, chat_id: int):
         return False, str(e)
 
 
-# --- UNIFIED WARNING AND AUTO-MUTE PROCESSOR ---
+# --- UNIFIED WARNING AND AUTO-MUTE PROCESSOR (1 HOUR MUTE ON 3 WARNS) ---
 async def process_violation(client: Client, message: Message, user, reason: str, header: str):
     chat_id = message.chat.id
     try:
@@ -921,7 +921,7 @@ async def promote_user_owner(client: Client, message: Message):
 @app.on_message(filters.user(OWNER_ID) & filters.command(["groups", "stats"]))
 async def bot_groups_analytics(client: Client, message: Message):
     protect_btn = get_protect_btn(client)
-    status_msg = await message.reply_text("📊 Fetching group statistics & links...", reply_markup=protect_btn)
+    status_msg = await message.reply_text("📊 Fetching group statistics...", reply_markup=protect_btn)
     groups = get_all_groups_details()
 
     if not groups:
@@ -929,20 +929,10 @@ async def bot_groups_analytics(client: Client, message: Message):
 
     out = "📋 **Managed Network Groups**\n───•────────────────•───\n\n"
     for chat_id, title, username in groups:
-        if username:
-            link = f"https://t.me/{username}"
-        else:
-            chat_str = str(chat_id)
-            if chat_str.startswith("-100"):
-                link = f"https://t.me/c/{chat_str[4:]}/1"
-            elif chat_str.startswith("-"):
-                link = f"https://t.me/c/{chat_str[1:]}/1"
-            else:
-                link = f"ID: `{chat_id}`"
+        link = f"https://t.me/{username}" if username else f"ID: `{chat_id}`"
+        out += f"• **{title or 'Group'}** | {link}\n"
 
-        out += f"• **{title or 'Group'}**\n   🔗 {link}\n\n"
-
-    out += f"📊 **Total Groups:** `{len(groups)}`"
+    out += f"\n📊 **Total Groups:** `{len(groups)}`"
     await status_msg.edit_text(out[:4000], reply_markup=protect_btn, disable_web_page_preview=True)
 
 
