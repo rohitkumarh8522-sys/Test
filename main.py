@@ -31,7 +31,7 @@ def start_dummy_server():
 threading.Thread(target=start_dummy_server, daemon=True).start()
 
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ChatPrivileges, ChatPermissions
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ChatPrivileges, ChatPermissions, ChatMemberUpdated
 from pyrogram.errors import ChatAdminRequired, RPCError
 from pyrogram.raw import functions
 
@@ -236,6 +236,20 @@ async def delete_previous_bot_msg(chat_id: int):
         except Exception:
             pass
 
+# --- AUTOMATIC GROUP TRACKER ---
+@app.on_my_chat_member()
+async def track_bot_chats(client: Client, update: ChatMemberUpdated):
+    chat = update.chat
+    if update.new_chat_member:
+        status = update.new_chat_member.status
+        st_val = status.value if hasattr(status, "value") else str(status)
+        
+        if st_val in ["member", "administrator"]:
+            save_or_update_group(chat.id, chat.title, chat.username)
+        elif st_val in ["left", "banned"]:
+            cursor.execute("DELETE FROM groups WHERE chat_id = ?", (chat.id,))
+            conn.commit()
+
 # --- ADMIN PERMISSION CHECKER ---
 async def check_bot_admin_rights(client: Client, chat_id: int):
     try:
@@ -252,7 +266,7 @@ async def check_bot_admin_rights(client: Client, chat_id: int):
         return False, str(e)
 
 
-# --- UNIFIED WARNING AND AUTO-MUTE PROCESSOR (1 HOUR MUTE ON 3 WARNS) ---
+# --- UNIFIED WARNING AND AUTO-MUTE PROCESSOR ---
 async def process_violation(client: Client, message: Message, user, reason: str, header: str):
     chat_id = message.chat.id
     try:
@@ -353,7 +367,7 @@ async def group_status(client: Client, message: Message):
         f"{icon(s['nolinks'])} Links filter `/nolinks`\n"
         f"{icon(s['forward_protect'])} Forwards filter `/noforwards`\n"
         f"{icon(s['nolocations'])} Locations filter `/nolocations`\n"
-        f"{icon(s['nocontacts'])} Contacts filter `/nolocations`\n"
+        f"{icon(s['nocontacts'])} Contacts filter `/nocontacts`\n"
         f"{icon(s['nocommands'])} Commands filter `/nocommands`\n"
         f"{icon(s['nohashtags'])} Hashtags filter `/nohashtags`\n"
         f"{icon(s['novoice'])} Voice filter `/novoice`\n"
@@ -907,7 +921,7 @@ async def promote_user_owner(client: Client, message: Message):
 @app.on_message(filters.user(OWNER_ID) & filters.command(["groups", "stats"]))
 async def bot_groups_analytics(client: Client, message: Message):
     protect_btn = get_protect_btn(client)
-    status_msg = await message.reply_text("📊 Fetching group statistics...", reply_markup=protect_btn)
+    status_msg = await message.reply_text("📊 Fetching group statistics & links...", reply_markup=protect_btn)
     groups = get_all_groups_details()
 
     if not groups:
@@ -915,10 +929,29 @@ async def bot_groups_analytics(client: Client, message: Message):
 
     out = "📋 **Managed Network Groups**\n───•────────────────•───\n\n"
     for chat_id, title, username in groups:
-        link = f"https://t.me/{username}" if username else f"ID: `{chat_id}`"
-        out += f"• **{title or 'Group'}** | {link}\n"
+        link = ""
+        if username:
+            link = f"https://t.me/{username}"
+        else:
+            try:
+                chat = await client.get_chat(chat_id)
+                link = chat.invite_link
+                if not link:
+                    chat_str = str(chat_id)
+                    if chat_str.startswith("-100"):
+                        link = f"https://t.me/c/{chat_str[4:]}/1"
+                    else:
+                        link = f"ID: `{chat_id}`"
+            except Exception:
+                chat_str = str(chat_id)
+                if chat_str.startswith("-100"):
+                    link = f"https://t.me/c/{chat_str[4:]}/1"
+                else:
+                    link = f"ID: `{chat_id}`"
 
-    out += f"\n📊 **Total Groups:** `{len(groups)}`"
+        out += f"• **{title or 'Group'}**\n   🔗 {link}\n\n"
+
+    out += f"📊 **Total Groups:** `{len(groups)}`"
     await status_msg.edit_text(out[:4000], reply_markup=protect_btn, disable_web_page_preview=True)
 
 
