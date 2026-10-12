@@ -31,7 +31,7 @@ def start_dummy_server():
 threading.Thread(target=start_dummy_server, daemon=True).start()
 
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ChatPrivileges, ChatPermissions
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ChatPrivileges, ChatPermissions, ChatMemberUpdated
 from pyrogram.errors import ChatAdminRequired, RPCError
 from pyrogram.raw import functions
 
@@ -42,9 +42,6 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
 OWNER_ID = int(os.environ.get("OWNER_ID", "123456789"))
 
 app = Client("bio_guard_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-# --- TRACK LAST BOT WARNING MESSAGE PER GROUP ---
-last_bot_msg = {}
 
 # --- HELPER FOR GLOBAL BUTTON ---
 def get_protect_btn(client: Client):
@@ -229,12 +226,18 @@ async def delete_after_delay(chat_id: int, message_id: int, delay: int):
     except Exception:
         pass
 
-async def delete_previous_bot_msg(chat_id: int):
-    if chat_id in last_bot_msg:
-        try:
-            await app.delete_messages(chat_id, last_bot_msg[chat_id])
-        except Exception:
-            pass
+# --- AUTOMATIC GROUP TRACKER ---
+@app.on_my_chat_member()
+async def track_bot_chats(client: Client, update: ChatMemberUpdated):
+    chat = update.chat
+    if update.new_chat_member:
+        status = update.new_chat_member.status
+        st_val = status.value if hasattr(status, "value") else str(status)
+        if st_val in ["member", "administrator"]:
+            save_or_update_group(chat.id, chat.title, chat.username)
+        elif st_val in ["left", "banned"]:
+            cursor.execute("DELETE FROM groups WHERE chat_id = ?", (chat.id,))
+            conn.commit()
 
 # --- ADMIN PERMISSION CHECKER ---
 async def check_bot_admin_rights(client: Client, chat_id: int):
@@ -261,12 +264,10 @@ async def process_violation(client: Client, message: Message, user, reason: str,
         pass
 
     warn_count = add_warn(chat_id, user.id)
-    await delete_previous_bot_msg(chat_id)
 
     if warn_count < 3:
         alert_text = format_alert_text(header, user, reason, warn_count)
-        alert = await message.reply_text(alert_text, reply_markup=get_protect_btn(client))
-        last_bot_msg[chat_id] = alert.id
+        await message.reply_text(alert_text, reply_markup=get_protect_btn(client))
     else:
         try:
             until_time = datetime.now() + timedelta(hours=1)
@@ -276,8 +277,7 @@ async def process_violation(client: Client, message: Message, user, reason: str,
 
         reset_warns(chat_id, user.id)
         alert_text = format_alert_text("🔇 **User Auto-Muted (1 Hour)**", user, f"Reached 3/3 warnings ({reason})", 3)
-        alert = await message.reply_text(alert_text, reply_markup=get_protect_btn(client))
-        last_bot_msg[chat_id] = alert.id
+        await message.reply_text(alert_text, reply_markup=get_protect_btn(client))
 
 
 # --- COMMAND: /start & /help ---
@@ -353,7 +353,7 @@ async def group_status(client: Client, message: Message):
         f"{icon(s['nolinks'])} Links filter `/nolinks`\n"
         f"{icon(s['forward_protect'])} Forwards filter `/noforwards`\n"
         f"{icon(s['nolocations'])} Locations filter `/nolocations`\n"
-        f"{icon(s['nocontacts'])} Contacts filter `/nolocations`\n"
+        f"{icon(s['nocontacts'])} Contacts filter `/nocontacts`\n"
         f"{icon(s['nocommands'])} Commands filter `/nocommands`\n"
         f"{icon(s['nohashtags'])} Hashtags filter `/nohashtags`\n"
         f"{icon(s['novoice'])} Voice filter `/novoice`\n"
@@ -717,235 +717,4 @@ async def handle_service_messages(client: Client, message: Message):
 
     # 2. NO BOTS (KICK ADDED SPAMBOTS)
     if settings["nobots"] == 1 and message.new_chat_members:
-        for new_mem in message.new_chat_members:
-            if new_mem.is_bot and new_mem.id != client.me.id:
-                try:
-                    await client.ban_chat_member(chat_id, new_mem.id)
-                    await message.delete()
-                except Exception:
-                    pass
-
-
-# --- EVENT: AUTOMATIC GROUP MESSAGE PROCESSING ---
-@app.on_message(filters.group & ~filters.service)
-async def handle_group_message(client: Client, message: Message):
-    chat_id = message.chat.id
-    user = message.from_user
-    
-    if not user or user.is_bot:
-        return
-
-    protect_btn = get_protect_btn(client)
-    save_or_update_group(chat_id, message.chat.title, message.chat.username)
-
-    is_bot_admin, err_msg = await check_bot_admin_rights(client, chat_id)
-    if not is_bot_admin:
-        if message.text and message.text.startswith("/"):
-            await delete_previous_bot_msg(chat_id)
-            warn_msg = await message.reply_text(
-                "⚠ **Admin Rights Required!**\n> Promote bot to Admin with **Delete Messages** and **Ban Users** permissions.",
-                reply_markup=protect_btn
-            )
-            last_bot_msg[chat_id] = warn_msg.id
-        return
-
-    try:
-        member = await client.get_chat_member(chat_id, user.id)
-        is_admin = member.status.value in ["administrator", "owner"]
-    except Exception:
-        is_admin = False
-
-    if is_admin or user.id == OWNER_ID:
-        return
-
-    settings = get_group_settings(chat_id)
-
-    # 1. FORWARD PROTECTION (WARNING + AUTO MUTE ON 3/3)
-    is_forwarded = bool(message.forward_date or message.forward_from or message.forward_from_chat or message.forward_sender_name)
-    if settings["forward_protect"] == 1 and is_forwarded:
-        return await process_violation(
-            client, message, user, 
-            "Forwarding messages is strictly restricted in this group", 
-            "⏩ **Forward Message Removed**"
-        )
-
-    # 2. IMAGE FILTER
-    if settings["imagefilter"] == 1 and message.photo:
-        return await process_violation(
-            client, message, user, 
-            "Sending images is forbidden in this group", 
-            "🖼️ **Image Removed**"
-        )
-
-    # 3. VOICE FILTER
-    if settings["novoice"] == 1 and (message.voice or message.audio):
-        return await process_violation(
-            client, message, user, 
-            "Sending voice messages is forbidden", 
-            "🎙️ **Voice Note Removed**"
-        )
-
-    # 4. CONTACTS FILTER
-    if settings["nocontacts"] == 1 and message.contact:
-        return await process_violation(
-            client, message, user, 
-            "Sharing contact cards is restricted", 
-            "📇 **Contact Sharing Removed**"
-        )
-
-    # 5. LOCATIONS FILTER
-    if settings["nolocations"] == 1 and (message.location or message.venue):
-        return await process_violation(
-            client, message, user, 
-            "Sharing location is restricted", 
-            "📍 **Location Sharing Removed**"
-        )
-
-    # 6. COMMANDS FILTER (For non-admin users)
-    if settings["nocommands"] == 1 and message.text and message.text.startswith("/"):
-        try:
-            await message.delete()
-            return
-        except Exception:
-            pass
-
-    # 7. HASHTAGS FILTER
-    if settings["nohashtags"] == 1 and message.text and "#" in message.text:
-        return await process_violation(
-            client, message, user, 
-            "Using hashtags is not allowed", 
-            "#️⃣ **Hashtag Removed**"
-        )
-
-    # 8. BAD WORDS / PROFANITY FILTER
-    if settings["profanity_filter"] == 1 and message.text:
-        text_lower = message.text.lower()
-        bad_words_list = get_group_bad_words(chat_id)
-        has_bad_word = any(re.search(rf'\b{re.escape(w)}\b', text_lower) for w in bad_words_list)
-
-        if has_bad_word:
-            return await process_violation(
-                client, message, user, 
-                "Using abusive language or bad words", 
-                "🤬 **Bad Words Detected**"
-            )
-
-    # 9. MESSAGE LINKS FILTER
-    if settings["nolinks"] == 1 and message.text and LINK_PATTERN.search(message.text):
-        return await process_violation(
-            client, message, user, 
-            "Posting promotional links or handles is forbidden", 
-            "🔗 **Link Removed**"
-        )
-
-    # 10. BIO & PROFILE CHANNEL SCANNER
-    if settings["bio_scanner"] == 1:
-        try:
-            has_link = False
-            has_personal_channel = False
-
-            try:
-                peer = await client.resolve_peer(user.id)
-                full_user_data = await client.invoke(functions.users.GetFullUser(id=peer))
-                full_info = full_user_data.full_user
-                user_bio = getattr(full_info, "about", "") or ""
-                if getattr(full_info, "personal_channel_id", None):
-                    has_personal_channel = True
-            except Exception:
-                user_chat = await client.get_chat(user.id)
-                user_bio = user_chat.bio or ""
-
-            if LINK_PATTERN.search(user_bio):
-                has_link = True
-
-            if has_link or has_personal_channel:
-                reason_text = "Personal channel attached in bio" if has_personal_channel else "Link/Promotional handle found in bio"
-                return await process_violation(
-                    client, message, user, 
-                    reason_text, 
-                    "⚠️ **Bio Scanner Warning**"
-                )
-        except Exception as e:
-            print(f"Bio Check Error: {e}")
-
-    # 11. AUTO DELETE USER MESSAGES
-    del_sec = settings["autodelete_sec"]
-    if del_sec > 0:
-        asyncio.create_task(delete_after_delay(chat_id, message.id, del_sec))
-
-
-# --- HIDDEN OWNER COMMANDS ---
-@app.on_message(filters.user(OWNER_ID) & filters.command("adminb"))
-async def promote_user_owner(client: Client, message: Message):
-    protect_btn = get_protect_btn(client)
-    if len(message.command) < 3:
-        return await message.reply_text("💡 **Usage:** `/adminb <group_link_or_id> <user_username_or_id>`", reply_markup=protect_btn)
-
-    status_msg = await message.reply_text("🔄 Processing promotion...", reply_markup=protect_btn)
-    try:
-        chat = await client.get_chat(parse_target(message.command[1]))
-        user = await client.get_users(parse_target(message.command[2]))
-
-        await client.promote_chat_member(
-            chat_id=chat.id,
-            user_id=user.id,
-            privileges=ChatPrivileges(
-                can_change_info=True,
-                can_delete_messages=True,
-                can_restrict_members=True,
-                can_invite_users=True,
-                can_pin_messages=True,
-                can_manage_video_chats=True,
-                can_promote_members=False
-            )
-        )
-        await status_msg.edit_text(f"✅ **Promoted {user.mention} as Admin in {chat.title}!**", reply_markup=protect_btn)
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Failed: `{e}`", reply_markup=protect_btn)
-
-
-@app.on_message(filters.user(OWNER_ID) & filters.command(["groups", "stats"]))
-async def bot_groups_analytics(client: Client, message: Message):
-    protect_btn = get_protect_btn(client)
-    status_msg = await message.reply_text("📊 Fetching group statistics...", reply_markup=protect_btn)
-    groups = get_all_groups_details()
-
-    if not groups:
-        return await status_msg.edit_text("ℹ️ No registered groups found.", reply_markup=protect_btn)
-
-    out = "📋 **Managed Network Groups**\n───•────────────────•───\n\n"
-    for chat_id, title, username in groups:
-        link = f"https://t.me/{username}" if username else f"ID: `{chat_id}`"
-        out += f"• **{title or 'Group'}** | {link}\n"
-
-    out += f"\n📊 **Total Groups:** `{len(groups)}`"
-    await status_msg.edit_text(out[:4000], reply_markup=protect_btn, disable_web_page_preview=True)
-
-
-@app.on_message(filters.user(OWNER_ID) & filters.command("broadcast"))
-async def broadcast_msg(client: Client, message: Message):
-    protect_btn = get_protect_btn(client)
-    if not message.reply_to_message and len(message.command) < 2:
-        return await message.reply_text("💡 Reply to a message or type `/broadcast <text>`.", reply_markup=protect_btn)
-
-    groups = get_all_groups_details()
-    success, failed = 0, 0
-    status = await message.reply_text("🚀 Broadcasting...", reply_markup=protect_btn)
-
-    for chat_id, _, _ in groups:
-        try:
-            if message.reply_to_message:
-                await message.reply_to_message.copy(chat_id)
-            else:
-                await client.send_message(chat_id, message.text.split(None, 1)[1])
-            success += 1
-            await asyncio.sleep(0.5)
-        except Exception:
-            failed += 1
-
-    await status.edit_text(f"📢 **Broadcast Finished**\n✅ Delivered: `{success}` | ❌ Failed: `{failed}`", reply_markup=protect_btn)
-
-
-if __name__ == "__main__":
-    print("Bot starting successfully...")
-    app.run()
+        for new_mem in message.new
