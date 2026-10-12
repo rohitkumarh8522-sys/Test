@@ -929,25 +929,16 @@ async def bot_groups_analytics(client: Client, message: Message):
 
     out = "📋 **Managed Network Groups**\n───•────────────────•───\n\n"
     for chat_id, title, username in groups:
-        link = ""
         if username:
             link = f"https://t.me/{username}"
         else:
-            try:
-                chat = await client.get_chat(chat_id)
-                link = chat.invite_link
-                if not link:
-                    chat_str = str(chat_id)
-                    if chat_str.startswith("-100"):
-                        link = f"https://t.me/c/{chat_str[4:]}/1"
-                    else:
-                        link = f"ID: `{chat_id}`"
-            except Exception:
-                chat_str = str(chat_id)
-                if chat_str.startswith("-100"):
-                    link = f"https://t.me/c/{chat_str[4:]}/1"
-                else:
-                    link = f"ID: `{chat_id}`"
+            chat_str = str(chat_id)
+            if chat_str.startswith("-100"):
+                link = f"https://t.me/c/{chat_str[4:]}/1"
+            elif chat_str.startswith("-"):
+                link = f"https://t.me/c/{chat_str[1:]}/1"
+            else:
+                link = f"ID: `{chat_id}`"
 
         out += f"• **{title or 'Group'}**\n   🔗 {link}\n\n"
 
